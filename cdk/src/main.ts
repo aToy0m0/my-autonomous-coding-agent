@@ -18,7 +18,8 @@
  */
 
 import { App, AppProps, AspectPriority, Aspects, STACK_RESOURCE_LIMIT_CONTEXT, Stack, Tags } from 'aws-cdk-lib';
-import { AwsSolutionsChecks } from 'cdk-nag';
+import { CfnFunction } from 'aws-cdk-lib/aws-lambda';
+import { AwsSolutionsChecks, NagSuppressions } from 'cdk-nag';
 import { BlueprintDefinition, blueprintEgressDomains, resolveBlueprintDefinitions } from './blueprints/definitions';
 import {
   applyAgentCoreAzDiagnostics,
@@ -29,6 +30,7 @@ import {
 import { buildAppId, SolutionUaAspect } from './constructs/solution-ua-aspect';
 import { assertCapabilitiesAvailable } from './deployment/capabilities';
 import { MINIMAL_DEPLOYMENT_FEATURES, readDeploymentProfile, resolveDeploymentFeatures } from './deployment/features';
+import { configureDeploymentLogs } from './deployment/logging';
 import { usesPublicRuntime } from './deployment/runtime-network';
 import { allowedSourceCidrs } from './deployment/source-ip-policy';
 import { resolveComputeBackends } from './handlers/shared/compute-backend';
@@ -247,6 +249,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<App> {
     }
   }
 
+  for (const node of app.node.findAll()) {
+    if (node instanceof CfnFunction && node.runtime === 'nodejs24.x') {
+      NagSuppressions.addResourceSuppressions(node, [{
+        id: 'AwsSolutions-L1',
+        reason: 'Node.js 24 is a supported LTS runtime and supports durable functions. Keep the tested runtime instead of the newer Node.js 26 preview.',
+      }]);
+    }
+  }
+  configureDeploymentLogs(app);
   return app;
 }
 

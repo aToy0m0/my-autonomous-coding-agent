@@ -22,9 +22,17 @@ ARG GH_VERSION=2.103.3
 FROM --platform=$TARGETPLATFORM jdxcode/mise:latest@sha256:df5adf538c92d86f9807e738c7c7a9b32a1ae06edf441ede141333e3fe6a2cd9 AS mise
 
 # Build gh with a patched Go toolchain; upstream packages can lag Go CVE fixes.
-FROM --platform=$TARGETPLATFORM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS gh-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS gh-builder
 ARG GH_VERSION
-RUN GOPROXY=direct GOBIN=/out go install "github.com/cli/cli/v2/cmd/gh@v${GH_VERSION}"
+ARG TARGETARCH
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOPROXY=direct go install "github.com/cli/cli/v2/cmd/gh@v${GH_VERSION}" && \
+    mkdir -p /out && \
+    if [ "$(go env GOARCH)" = "$TARGETARCH" ]; then \
+        cp /go/bin/gh /out/gh; \
+    else \
+        cp "/go/bin/linux_${TARGETARCH}/gh" /out/gh; \
+    fi
 
 FROM --platform=$TARGETPLATFORM python:3.13-slim@sha256:dc1546eefcbe8caaa1f004f16ab76b204b5e1dbd58ff81b899f21cd40541232f
 

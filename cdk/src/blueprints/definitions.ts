@@ -31,9 +31,11 @@ export function resolveBlueprintDefinitions(
   node: Node,
   environment: NodeJS.ProcessEnv = process.env,
 ): readonly BlueprintDefinition[] {
-  const definitions: BlueprintDefinition[] = [{
+  // Explicit false permits deploying the platform before choosing a repository.
+  const repo = environment.BLUEPRINT_REPO ?? node.tryGetContext('blueprintRepo') ?? 'awslabs/agent-plugins';
+  const definitions: BlueprintDefinition[] = repo === false ? [] : [{
     id: 'AgentPluginsBlueprint',
-    repo: environment.BLUEPRINT_REPO ?? node.tryGetContext('blueprintRepo') ?? 'awslabs/agent-plugins',
+    repo,
     // Personal-use default; task submissions may explicitly override this model-spend budget.
     agent: { maxBudgetUsd: 1 },
   }];

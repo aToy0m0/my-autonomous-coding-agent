@@ -116,10 +116,26 @@ describe('Personal low-cost deployment', () => {
     }
   });
 
+  test('all Lambda functions use explicit log groups and every log group retains 180 days', () => {
+    for (const template of templates) {
+      for (const resource of Object.values(template.findResources('AWS::Lambda::Function'))) {
+        expect(resource.Properties.LoggingConfig?.LogGroup).toBeDefined();
+      }
+      for (const resource of Object.values(template.findResources('AWS::Logs::LogGroup'))) {
+        expect(resource.Properties.RetentionInDays).toBe(180);
+      }
+    }
+  });
+
   test('uses the lower-cost model and a model-spend budget for the bundled repository', () => {
     expect(PLATFORM_DEFAULT_MODEL_ID).toBe('anthropic.claude-sonnet-4-6');
     const blueprints = resolveBlueprintDefinitions(new App().node, {});
     expect(blueprints[0].agent?.maxBudgetUsd).toBe(1);
+  });
+
+  test('can deploy before choosing a repository without registering an upstream example', () => {
+    const node = new App({ context: { blueprintRepo: false } }).node;
+    expect(resolveBlueprintDefinitions(node, {})).toEqual([]);
   });
 
   test.each([

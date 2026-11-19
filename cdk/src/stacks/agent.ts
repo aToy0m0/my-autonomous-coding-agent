@@ -611,7 +611,10 @@ export class AgentStack extends Stack {
     let runtime: agentcore.Runtime | undefined;
     let agentLogGroup: logs.ILogGroup | undefined;
     if (agentCoreEnabled) {
-      const artifact = agentcore.AgentRuntimeArtifact.fromAsset(repoRoot, { file: 'agent/Dockerfile' });
+      const artifact = agentcore.AgentRuntimeArtifact.fromAsset(repoRoot, {
+        file: 'agent/Dockerfile',
+        platform: ecr_assets.Platform.LINUX_ARM64,
+      });
       const runtimeEnvironmentVariables = {
         GITHUB_TOKEN_SECRET_ARN: githubTokenSecret.secretArn,
         AWS_REGION: process.env.AWS_REGION ?? 'us-east-1',
