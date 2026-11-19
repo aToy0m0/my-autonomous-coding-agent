@@ -1,0 +1,876 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import { PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  autoLinkTokenOwner,
+  chooseSetupRedirect,
+  findReusableOauthAppCredentials,
+  findWorkspaceRowBySlug,
+  isWebhookSecretConfigured,
+  queryLinearTeamKeys,
+  parsePastedAuthorization,
+  renderLinearAppTemplate,
+} from '../../src/commands/linear';
+import * as config from '../../src/config';
+import { generateInviteCode, INVITE_CODE_ALPHABET } from '../../src/invite-code';
+
+jest.mock('@aws-sdk/lib-dynamodb', () => {
+  const actual = jest.requireActual('@aws-sdk/lib-dynamodb');
+  return {
+    ...actual,
+    DynamoDBDocumentClient: {
+      from: jest.fn(() => ({ send: ddbSend })),
+    },
+  };
+});
+
+const ddbSend = jest.fn();
+
+// Build a fake JWT with a `sub` claim; the CLI only base64url-decodes the payload.
+function fakeIdToken(sub: string): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ sub })).toString('base64url');
+  return `${header}.${payload}.sig`;
+}
+
+describe('autoLinkTokenOwner', () => {
+  const originalFetch = global.fetch;
+  let consoleLogSpy: jest.SpiedFunction<typeof console.log>;
+  let loadCredentialsSpy: jest.SpiedFunction<typeof config.loadCredentials>;
+
+  beforeEach(() => {
+    ddbSend.mockReset();
+    ddbSend.mockResolvedValue({});
+    consoleLogSpy = jest.spyOn(console, 'log').mockImplementation();
+    loadCredentialsSpy = jest.spyOn(config, 'loadCredentials');
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    consoleLogSpy.mockRestore();
+    loadCredentialsSpy.mockRestore();
+  });
+
+  test('writes an active mapping row when Linear responds and user is authenticated', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          viewer: { id: 'linear-user-uuid', name: 'Jean', email: 'jean@example.com' },
+          organization: { id: 'linear-org-uuid', name: 'ACME' },
+        },
+      }),
+    }) as unknown as typeof fetch;
+    loadCredentialsSpy.mockReturnValue({
+      id_token: fakeIdToken('cognito-sub-123'),
+      refresh_token: 'r',
+      token_expiry: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    await autoLinkTokenOwner({
+      region: 'us-east-1',
+      apiToken: 'lin_api_xyz',
+      userMappingTable: 'test-LinearUserMappingTable',
+    });
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.linear.app/graphql',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'lin_api_xyz' }),
+      }),
+    );
+    expect(ddbSend).toHaveBeenCalledTimes(1);
+    const putCmd = ddbSend.mock.calls[0][0] as PutCommand;
+    expect(putCmd.input.TableName).toBe('test-LinearUserMappingTable');
+    expect(putCmd.input.Item).toEqual(expect.objectContaining({
+      linear_identity: 'linear-org-uuid#linear-user-uuid',
+      platform_user_id: 'cognito-sub-123',
+      linear_workspace_id: 'linear-org-uuid',
+      linear_user_id: 'linear-user-uuid',
+      status: 'active',
+      link_method: 'auto_setup',
+    }));
+  });
+
+  test('skips gracefully with a warning when Linear API errors', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+    }) as unknown as typeof fetch;
+    loadCredentialsSpy.mockReturnValue({
+      id_token: fakeIdToken('cognito-sub-123'),
+      refresh_token: 'r',
+      token_expiry: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    await autoLinkTokenOwner({
+      region: 'us-east-1',
+      apiToken: 'lin_api_bad',
+      userMappingTable: 'test-LinearUserMappingTable',
+    });
+
+    expect(ddbSend).not.toHaveBeenCalled();
+    const msgs = consoleLogSpy.mock.calls.map(c => String(c[0]));
+    expect(msgs.some(m => m.includes('Could not auto-link'))).toBe(true);
+  });
+
+  test('skips gracefully when user is not logged in', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          viewer: { id: 'linear-user-uuid' },
+          organization: { id: 'linear-org-uuid' },
+        },
+      }),
+    }) as unknown as typeof fetch;
+    loadCredentialsSpy.mockReturnValue(null);
+
+    await autoLinkTokenOwner({
+      region: 'us-east-1',
+      apiToken: 'lin_api_xyz',
+      userMappingTable: 'test-LinearUserMappingTable',
+    });
+
+    expect(ddbSend).not.toHaveBeenCalled();
+    const msgs = consoleLogSpy.mock.calls.map(c => String(c[0]));
+    expect(msgs.some(m => m.includes('Could not resolve your platform user'))).toBe(true);
+    expect(msgs.some(m => m.includes('bgagent login'))).toBe(true);
+  });
+});
+
+/**
+ * Just the Redirect URIs block. The invariant is about what goes in that FIELD, not
+ * about the word "localhost" appearing anywhere — the traps below legitimately
+ * mention the loopback when explaining which command needs it.
+ */
+function redirectUriBlock(out: string): string {
+  const lines = out.split('\n');
+  const start = lines.findIndex((l) => l.includes('Redirect URIs'));
+  const end = lines.findIndex((l, i) => i > start && l.includes('Public:'));
+  // Without these a missing label makes slice(-1, end) return '', and every
+  // not.toContain assertion against the block passes vacuously.
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return lines.slice(start, end).join('\n');
+}
+
+describe('renderLinearAppTemplate', () => {
+  // Every expectation below was checked against Linear's ACTUAL app-creation form.
+  // The template previously asserted a GitHub-username field and a placeholder
+  // webhook URL that do not and should not exist there, which cost two onboarding
+  // attempts — so these tests pin the form's real field names and values.
+
+  test('uses sane defaults when no options are passed', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('Application name:    bgagent');
+    expect(out).toContain('Developer name:      ABCA');
+    expect(out).toContain('actor=app');
+  });
+
+  test('names the field "Redirect URIs", as Linear\'s form does', () => {
+    // It is not called "Callback URLs" anywhere in the form; an operator scanning
+    // for the label we printed would not find it.
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('Redirect URIs');
+    expect(out).not.toContain('Callback URLs');
+  });
+
+  test('does NOT ask for a GitHub username — the form has no such field', () => {
+    // Verified against the live form: icon, Application name, Developer name,
+    // Developer URL, Description, Redirect URIs. No GitHub username. Printing one
+    // sent operators to fix a field that does not exist while the real cause of
+    // "Invalid redirect_uri" (an unregistered URI) stayed broken.
+    const out = renderLinearAppTemplate({ appName: 'Acme Agent' });
+    expect(out).not.toMatch(/GitHub username/i);
+    expect(out).not.toMatch(/\[bot\]/);
+  });
+
+  /**
+   * The Redirect URIs field holds ONLY what Linear redirects to (#914).
+   *
+   * The live failure these pin: the template printed the hosted consent page as the
+   * sole Redirect URI, an operator registered exactly that, and `bgagent linear setup`
+   * still died on "Invalid redirect_uri parameter for the application" — because the
+   * consent page is AgentCore's `resourceOauth2ReturnUrl`, not Linear's `redirect_uri`.
+   * Linear redirects to the AgentCore provider callback on the vault path and to the
+   * CLI's loopback listener on the `add-workspace` path.
+   */
+  const HOSTED_CONSENT = 'https://d111111abcdef8.cloudfront.net/';
+  const VAULT_CALLBACK =
+    'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback/f8804c1b';
+
+  test('on the vault path the field holds the AgentCore callback, not the consent page', () => {
+    // The bug in one assertion: on the vault path Linear redirects to the callback, so a
+    // field holding only the consent page left the URI Linear needs missing. (The consent
+    // page IS the redirect_uri on setup's Secrets-Manager fallback — see the next test.)
+    const block = redirectUriBlock(renderLinearAppTemplate({
+      hostedConsentUrl: HOSTED_CONSENT,
+      vaultCallbackUrl: VAULT_CALLBACK,
+    }));
+    expect(block).not.toContain(HOSTED_CONSENT);
+    expect(block).toContain(VAULT_CALLBACK);
+  });
+
+  test('shows the consent page as a CONDITIONAL Redirect URI, outside the field', () => {
+    // #914 review: it was labelled "nothing to paste", but on setup's Secrets-Manager
+    // fallback it is exactly the redirect_uri Linear checks. It stays out of the field —
+    // the vault path does not use it — and says when it is needed.
+    const out = renderLinearAppTemplate({ hostedConsentUrl: HOSTED_CONSENT });
+    expect(out).toContain(`Identity vault consent page: ${HOSTED_CONSENT}`);
+    expect(out).toMatch(/Add it as a Redirect URI only if setup falls back to Secrets Manager/);
+    expect(out).not.toMatch(/nothing to paste/);
+    expect(redirectUriBlock(out)).not.toContain(HOSTED_CONSENT);
+  });
+
+  test('every redirect_uri setup can send on a vault stack is one the template tells you to register', () => {
+    // The invariant blocker 1 broke: template and setup drifted apart in one file. Derive
+    // the fallback's redirect_uri from setup's own choice, not from a literal here.
+    const fallback = chooseSetupRedirect({ vaultAccessToken: undefined, consentPageUrl: HOSTED_CONSENT });
+    expect(fallback.redirectUri).toBe(HOSTED_CONSENT);
+    const out = renderLinearAppTemplate({ hostedConsentUrl: HOSTED_CONSENT, vaultCallbackUrl: VAULT_CALLBACK });
+    const lines = out.split('\n');
+    const at = lines.findIndex((l) => l.includes(fallback.redirectUri));
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(lines[at + 1]).toMatch(/Add it as a Redirect URI/);
+    // And the vault leg's URI is in the field itself.
+    expect(redirectUriBlock(out)).toContain(VAULT_CALLBACK);
+  });
+
+  test('the vault leg sends no consent-page redirect', () => {
+    const vault = chooseSetupRedirect({ vaultAccessToken: 'tok', consentPageUrl: HOSTED_CONSENT });
+    expect(vault.hostedUrl).toBeUndefined();
+    expect(vault.redirectUri).toBe('http://localhost:8080/oauth/callback');
+  });
+
+  test('a failed stack lookup is SAID, rather than rendering a vault stack as no-vault', () => {
+    const out = renderLinearAppTemplate({ lookupWarning: 'Could not read stack st in us-east-1 (ExpiredToken).' });
+    expect(out).toMatch(/⚠ Could not read stack st in us-east-1 \(ExpiredToken\)\./);
+    expect(out).toMatch(/may be wrong — check credentials and --region/);
+  });
+
+  test('names the loopback for add-workspace when the vault hides it from the field', () => {
+    const out = renderLinearAppTemplate({ hostedConsentUrl: HOSTED_CONSENT });
+    expect(out).toMatch(/Using `add-workspace` instead of `setup`\? It redirects to http:\/\/localhost:8080\/oauth\/callback/);
+    // Not printed when the loopback is already the field's entry.
+    expect(renderLinearAppTemplate()).not.toMatch(/Using `add-workspace` instead/);
+  });
+
+  test('lists ONLY the AgentCore callback once the provider exists', () => {
+    // Listing the loopback beside it read as two required entries and sent vault
+    // operators to register a URI the vault path never redirects to.
+    const block = redirectUriBlock(renderLinearAppTemplate({
+      hostedConsentUrl: HOSTED_CONSENT,
+      vaultCallbackUrl: VAULT_CALLBACK,
+    }));
+    expect(block).toContain(VAULT_CALLBACK);
+    expect(block).not.toContain('http://localhost:8080/oauth/callback');
+  });
+
+  test('offers NO URI on a first vault run — the honest answer, not another flow\'s URI', () => {
+    // The callback id does not exist before setup registers the app, so there is nothing
+    // truthful to print. Printing the loopback instead gave a vault operator a URI that
+    // cannot work and no sign of the one that can.
+    const block = redirectUriBlock(renderLinearAppTemplate({ hostedConsentUrl: HOSTED_CONSENT }));
+    expect(block).not.toContain('http://localhost:8080/oauth/callback');
+    expect(block).toMatch(/Leave empty/);
+    expect(block).toMatch(/setup <slug>` prints the URI to add/);
+  });
+
+  test('every URI sits alone on its line, so no entry can wrap', () => {
+    // The traps list warns that a line-wrapped URI becomes two malformed entries, and
+    // `annotate` appends "← note" past a pad column — which on a ~100-char AgentCore
+    // callback would wrap it. So URI lines carry the URI and nothing else.
+    const block = redirectUriBlock(renderLinearAppTemplate({
+      hostedConsentUrl: HOSTED_CONSENT,
+      vaultCallbackUrl: VAULT_CALLBACK,
+    }));
+    for (const line of block.split('\n').filter((l) => l.includes('://'))) {
+      expect(line.trim()).not.toMatch(/←/);
+      expect(line.trim().split(/\s+/)).toHaveLength(1);
+    }
+  });
+
+  test('warns that redirect URIs match EXACTLY, including the trailing slash', () => {
+    // The live cause of a real dead-end: the consent page URL ends in "/" and an
+    // operator registered it without. Exact-string matching then rejects it.
+    const out = renderLinearAppTemplate();
+    expect(out).toMatch(/trailing slash/);
+    expect(out).toMatch(/match EXACTLY/);
+    // Wraps across lines in the rendered output, so match the leading phrase.
+    expect(out).toMatch(/Invalid redirect_uri/);
+  });
+
+  test('keeps the line-wrap and wildcard traps, which are real', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toMatch(/line-wrapped/);
+    expect(out).toMatch(/wildcard/);
+  });
+
+  test('prints the REAL webhook URL when it can resolve one', () => {
+    // It used to print https://example.com/placeholder and say no events were
+    // needed, which left operators with an app that could never deliver an event.
+    const url = 'https://abc123.execute-api.us-east-1.amazonaws.com/v1/linear/webhook';
+    const out = renderLinearAppTemplate({ webhookUrl: url });
+    expect(out).toContain(url);
+    expect(out).not.toContain('example.com/placeholder');
+  });
+
+  test('without a resolved webhook URL it names the command that prints one', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('webhook-info');
+    expect(out).not.toContain('example.com/placeholder');
+  });
+
+  test('requires Comments as well as Issues, or the comment trigger never fires', () => {
+    // Issues alone yields label-triggered tasks only. This is silent when wrong:
+    // labels keep working, so nothing looks broken until an @mention is ignored.
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('Issues + Comments');
+    expect(out).toMatch(/Tick Comments as well as Issues/);
+  });
+
+  test('tells the operator to keep the signing secret', () => {
+    expect(renderLinearAppTemplate()).toMatch(/signing secret/i);
+  });
+
+  test('says to leave App events OFF, and why', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toMatch(/App events \(agent session/);
+    expect(out).toMatch(/OFF/);
+    expect(out).toMatch(/comment thread/);
+  });
+
+  test('configures the webhook ON THE APP, so there is only one thing to set up', () => {
+    // The receiver routes on the payload's organizationId and verifies the HMAC
+    // against whichever secret it was given, so it does not care which surface the
+    // webhook was created on — one webhook on the app is the least to configure.
+    const out = renderLinearAppTemplate({ webhookUrl: 'https://x.example.com/v1/linear/webhook' });
+    expect(out).toMatch(/Webhooks:\s+ON/);
+    expect(out).toContain('https://x.example.com/v1/linear/webhook');
+    expect(out).toMatch(/Data change events:\s+Issues \+ Comments/);
+  });
+
+  test('warns that a second webhook on the app duplicates every event', () => {
+    // Two subscriptions to one endpoint means two signing secrets, and ABCA stores
+    // one per workspace — so the duplicate both doubles the work and fails to
+    // verify. Worth stating because pasting the URL in both places looks harmless.
+    const out = renderLinearAppTemplate();
+    expect(out).toMatch(/ONE webhook/);
+    expect(out).toMatch(/workspace webhook pointing here/);
+    expect(out).toMatch(/twice/);
+  });
+
+  test('names the agent whatever the operator chose', () => {
+    expect(renderLinearAppTemplate({ appName: 'Alan Turing' }))
+      .toContain('Application name:    Alan Turing');
+  });
+
+  test('states that renaming does NOT change the trigger phrase', () => {
+    // The trigger is a hardcoded @bgagent token in the platform, not the app name.
+    // Without this, renaming yields an agent that looks right and answers nothing.
+    const out = renderLinearAppTemplate({ appName: 'Alan Turing' });
+    expect(out).toContain('@bgagent <request>');
+    expect(out).toMatch(/not the trigger/);
+  });
+
+  test('a blank or whitespace name falls back to the default', () => {
+    expect(renderLinearAppTemplate({ appName: '   ' })).toContain('Application name:    bgagent');
+  });
+
+  test('lists exactly the one URI Linear redirects to on the operator\'s own path', () => {
+    // Corrected with #914. On the vault path Linear redirects to the AgentCore callback, so
+    // that is the field's one entry. The loopback (add-workspace) and the consent page
+    // (setup's Secrets-Manager fallback) are named separately, each with when it applies.
+    const out = renderLinearAppTemplate({
+      hostedConsentUrl: 'https://d111111abcdef8.cloudfront.net/',
+      vaultCallbackUrl: 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback/f88',
+    });
+    const block = redirectUriBlock(out);
+    expect(block).toContain('https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback/f88');
+    expect(block).not.toContain('http://localhost:8080/oauth/callback');
+    expect(block).not.toContain('https://d111111abcdef8.cloudfront.net/');
+    // And no vault-setup: that command no longer exists.
+    expect(out).not.toContain('vault-setup');
+  });
+
+  test('falls back to the loopback URI only when there is no hosted page', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('http://localhost:8080/oauth/callback');
+    expect(out).toMatch(/needs the browser on this machine/);
+    expect(out).toContain('enableLinearIdentityVault=true');
+  });
+
+  test('neither the consent page nor the loopback appears in the field on a vault first run', () => {
+    // Inverted with #914. The old behaviour put the consent page in the field as its only
+    // entry, which the vault path never sends — so registering exactly what the template
+    // printed still failed consent. Both are now named outside the field with when they apply.
+    const out = renderLinearAppTemplate({ hostedConsentUrl: 'https://d111111abcdef8.cloudfront.net/' });
+    const block = redirectUriBlock(out);
+    expect(block).not.toContain('https://d111111abcdef8.cloudfront.net/');
+    expect(block).not.toContain('http://localhost:8080/oauth/callback');
+  });
+
+  test('prints the hosted consent URI EXACTLY once, with no slashless variant', () => {
+    // An earlier version printed a second slashless variant as insurance against a
+    // typo. Linear validates the whole Redirect URIs field on save, so an extra bad
+    // line loses the good ones with it. Still worth pinning after #914 moved this URL
+    // out of the form: one occurrence, exactly as the stack exports it.
+    const hosted = 'https://d111111abcdef8.cloudfront.net/';
+    const slashless = hosted.replace(/\/$/, '');
+    const out = renderLinearAppTemplate({ hostedConsentUrl: hosted });
+    // Count occurrences of each exact form rather than trimmed whole lines: the URL now
+    // sits inline after a label, so a line-equality test would find neither.
+    expect(out.split(hosted)).toHaveLength(2);
+    expect(out.split(`${slashless}\n`)).toHaveLength(1);
+  });
+
+  test('defers to setup in ONE line — the field is the only thing it talks about', () => {
+    // The callback id does not exist until setup creates the provider, so there is nothing
+    // to paste yet. Everything else an operator might want here (why the ordering is like
+    // that, how to recover the URI for a workspace already onboarded via `--slug`) belongs
+    // to setup and to the flag's own help: a first-time reader has no workspace yet, and
+    // every extra sentence competes with the fields that ARE needed to create the app.
+    const out = renderLinearAppTemplate({ hostedConsentUrl: 'https://d111111abcdef8.cloudfront.net/' });
+    expect(out).toMatch(/Leave empty — `bgagent linear setup <slug>` prints the URI to add, then stops\./);
+    // Linear's form accepts an empty field (verified live), so no placeholder is needed.
+    expect(out).not.toMatch(/If Linear will not save an empty field/);
+    // The label plus one line of guidance, and no more.
+    const block = redirectUriBlock(out).split('\n').filter((l) => l.trim());
+    expect(block).toHaveLength(2);
+  });
+
+  test('without a hosted URL it explains the loopback limitation and the fix', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toMatch(/needs the browser on this machine/);
+    expect(out).toContain('enableLinearIdentityVault=true');
+  });
+
+  test('records that actor=app and the admin scope are mutually exclusive', () => {
+    expect(renderLinearAppTemplate()).toMatch(/cannot also request the `admin` scope/);
+  });
+
+  test('overrides developer fields and description', () => {
+    const out = renderLinearAppTemplate({
+      developerName: 'Acme Corp',
+      developerUrl: 'https://acme.com',
+      description: 'Internal coding agent',
+    });
+    expect(out).toContain('Acme Corp');
+    expect(out).toContain('https://acme.com');
+    expect(out).toContain('Internal coding agent');
+  });
+
+  test('stays short enough to act on — it is a form to fill, not a manual', () => {
+    // It grew to the point the operator stopped reading and missed real fields.
+    expect(renderLinearAppTemplate().split('\n').length).toBeLessThanOrEqual(50);
+  });
+});
+
+describe('isWebhookSecretConfigured', () => {
+  const mockSend = jest.fn();
+  const mockClient = { send: mockSend } as unknown as Parameters<typeof isWebhookSecretConfigured>[0];
+
+  beforeEach(() => {
+    mockSend.mockReset();
+  });
+
+  test('returns true for a Linear-shaped lin_wh_ secret', async () => {
+    mockSend.mockResolvedValueOnce({ SecretString: 'lin_wh_AbCdEfGhIjKlMnOpQrStUvWxYz' });
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(true);
+  });
+
+  test('returns false for the CDK-autogenerated placeholder', async () => {
+    // CDK's default Secret value is a JSON-encoded random string — does
+    // NOT start with lin_wh_. The check is a heuristic, not authoritative,
+    // but good enough to avoid re-prompting on every setup re-run.
+    mockSend.mockResolvedValueOnce({ SecretString: '{"":"abcd"}' });
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
+  });
+
+  test('returns false on ResourceNotFoundException (secret has not been created yet)', async () => {
+    const err = new Error('Secrets Manager cannot find the specified secret.');
+    err.name = 'ResourceNotFoundException';
+    mockSend.mockRejectedValueOnce(err);
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
+  });
+
+  test('throws on AccessDenied so operators see the IAM gap instead of a confusing re-prompt', async () => {
+    const err = new Error('User is not authorized to perform: secretsmanager:GetSecretValue');
+    err.name = 'AccessDeniedException';
+    mockSend.mockRejectedValueOnce(err);
+    await expect(isWebhookSecretConfigured(mockClient, 'arn:secret')).rejects.toThrow(/IAM permission gap/);
+  });
+
+  test('returns false when SecretString is missing', async () => {
+    mockSend.mockResolvedValueOnce({});
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
+  });
+});
+
+describe('findWorkspaceRowBySlug', () => {
+  // Regression: `bgagent linear vault-setup maguireb` reported an already-
+  // onboarded workspace as "not onboarded". Cause: the filtered Scan passed
+  // `Limit: 1`, and DynamoDB applies `Limit` to the items READ *before* the
+  // FilterExpression runs — so it read one arbitrary row (demo-abca), filtered
+  // it out, and returned nothing. Live-caught on a two-workspace registry.
+  beforeEach(() => {
+    ddbSend.mockReset();
+  });
+
+  const ddbClient = () => ({ send: ddbSend }) as unknown as Parameters<typeof findWorkspaceRowBySlug>[0];
+
+  test('finds a workspace that is NOT the first row scanned', async () => {
+    // Mirrors the live table: demo-abca first, maguireb second.
+    ddbSend.mockResolvedValueOnce({
+      Items: [
+        { workspace_slug: 'demo-abca', linear_workspace_id: 'ws-demo', oauth_secret_arn: 'arn:demo' },
+        { workspace_slug: 'maguireb', linear_workspace_id: 'ws-mag', oauth_secret_arn: 'arn:mag' },
+      ],
+    });
+    const row = await findWorkspaceRowBySlug(ddbClient(), 'TestRegistry', 'maguireb');
+    expect(row?.linear_workspace_id).toBe('ws-mag');
+  });
+
+  test('passes NO Limit on the filtered scan (the bug that broke the lookup)', async () => {
+    ddbSend.mockResolvedValueOnce({ Items: [] });
+    await findWorkspaceRowBySlug(ddbClient(), 'TestRegistry', 'maguireb');
+    const scanCmd = ddbSend.mock.calls[0][0] as ScanCommand;
+    expect(scanCmd.input.FilterExpression).toBe('workspace_slug = :s');
+    // A Limit here silently breaks the lookup — see the describe comment.
+    expect(scanCmd.input.Limit).toBeUndefined();
+  });
+
+  test('returns undefined when the workspace is genuinely absent', async () => {
+    ddbSend.mockResolvedValueOnce({
+      Items: [{ workspace_slug: 'demo-abca', linear_workspace_id: 'ws-demo' }],
+    });
+    expect(await findWorkspaceRowBySlug(ddbClient(), 'TestRegistry', 'maguireb')).toBeUndefined();
+  });
+});
+
+describe('findReusableOauthAppCredentials', () => {
+  // The helper is the linchpin of `bgagent linear add-workspace`: if it
+  // returns the wrong (or no) values, the operator either gets a confusing
+  // re-prompt or — worse — installs a workspace against an OAuth app that
+  // doesn't match the existing workspaces' refresh-token rotations.
+  const smSend = jest.fn();
+  const smClient = { send: smSend } as unknown as Parameters<typeof findReusableOauthAppCredentials>[1];
+
+  beforeEach(() => {
+    ddbSend.mockReset();
+    smSend.mockReset();
+  });
+
+  test('returns null when registry has no active rows', async () => {
+    ddbSend.mockResolvedValueOnce({ Items: [] });
+    const ddbClient = { send: ddbSend } as unknown as Parameters<typeof findReusableOauthAppCredentials>[0];
+    expect(await findReusableOauthAppCredentials(ddbClient, smClient, 'TestRegistry')).toBeNull();
+    // Verify the scan filter is the active-status one, not a full table scan.
+    const scanCmd = ddbSend.mock.calls[0][0] as ScanCommand;
+    expect(scanCmd.input.FilterExpression).toBe('#status = :active');
+    expect(scanCmd.input.Limit).toBe(1);
+  });
+
+  test('returns credentials from the first active workspace', async () => {
+    ddbSend.mockResolvedValueOnce({
+      Items: [{
+        workspace_slug: 'acme',
+        oauth_secret_arn: 'arn:secret:acme',
+        status: 'active',
+      }],
+    });
+    smSend.mockResolvedValueOnce({
+      SecretString: JSON.stringify({
+        access_token: 'lin_at',
+        refresh_token: 'lin_rt',
+        client_id: 'cid-acme',
+        client_secret: 'csec-acme',
+        workspace_id: 'ws-1',
+        workspace_slug: 'acme',
+      }),
+    });
+    const ddbClient = { send: ddbSend } as unknown as Parameters<typeof findReusableOauthAppCredentials>[0];
+    const result = await findReusableOauthAppCredentials(ddbClient, smClient, 'TestRegistry');
+    expect(result).toEqual({
+      clientId: 'cid-acme',
+      clientSecret: 'csec-acme',
+      sourceSlug: 'acme',
+    });
+  });
+
+  test('throws CliError on corrupted SecretString JSON (distinct from "no active workspace")', async () => {
+    // Reviewer flagged: a corrupt secret value used to fall through as
+    // null and surface the same message as "no active workspace, run
+    // setup", nudging the operator toward a duplicate install. The
+    // distinct error tells them which workspace's secret needs repair.
+    ddbSend.mockResolvedValueOnce({
+      Items: [{ workspace_slug: 's', oauth_secret_arn: 'arn:s', status: 'active' }],
+    });
+    smSend.mockResolvedValueOnce({ SecretString: '{not valid json' });
+    const ddbClient = { send: ddbSend } as unknown as Parameters<typeof findReusableOauthAppCredentials>[0];
+    await expect(
+      findReusableOauthAppCredentials(ddbClient, smClient, 'TestRegistry'),
+    ).rejects.toThrow(/not valid JSON/);
+  });
+
+  test('throws CliError when SecretString is missing on a registered workspace', async () => {
+    // Same rationale as above: a registered workspace whose SM secret
+    // has no value is a broken state, not an absence of installs.
+    ddbSend.mockResolvedValueOnce({
+      Items: [{ workspace_slug: 's', oauth_secret_arn: 'arn:s', status: 'active' }],
+    });
+    smSend.mockResolvedValueOnce({});
+    const ddbClient = { send: ddbSend } as unknown as Parameters<typeof findReusableOauthAppCredentials>[0];
+    await expect(
+      findReusableOauthAppCredentials(ddbClient, smClient, 'TestRegistry'),
+    ).rejects.toThrow(/has no value/);
+  });
+
+  test('throws CliError when stored OAuth bundle is missing client_id/client_secret', async () => {
+    // The third "broken state" branch covered before by null-return.
+    ddbSend.mockResolvedValueOnce({
+      Items: [{ workspace_slug: 's', oauth_secret_arn: 'arn:s', status: 'active' }],
+    });
+    smSend.mockResolvedValueOnce({
+      SecretString: JSON.stringify({ access_token: 'a', refresh_token: 'r' }),
+    });
+    const ddbClient = { send: ddbSend } as unknown as Parameters<typeof findReusableOauthAppCredentials>[0];
+    await expect(
+      findReusableOauthAppCredentials(ddbClient, smClient, 'TestRegistry'),
+    ).rejects.toThrow(/client_id or client_secret/);
+  });
+});
+
+describe('generateInviteCode', () => {
+  // The invite code is the security boundary between admin and teammate
+  // in the link handshake — admin shares it, teammate redeems it. The
+  // properties we care about: prefix, length, ambiguous-glyph
+  // exclusion, and that the consumer-side regex (`linear-link.ts`)
+  // accepts what we produce.
+  test('emits "link-" prefix followed by exactly 8 alphabet characters', () => {
+    const code = generateInviteCode();
+    expect(code).toMatch(/^link-[a-z0-9]{8}$/);
+    expect(code).toHaveLength(13);
+  });
+
+  test('only uses characters from the unambiguous alphabet', () => {
+    // The alphabet excludes 0, O, 1, l, I to make codes safe to
+    // copy-paste across fonts. A regression that pulls a forbidden
+    // character in (e.g. broken Math.random or alphabet typo) would
+    // get caught here statistically over 200 runs.
+    for (let i = 0; i < 200; i++) {
+      const code = generateInviteCode();
+      const chars = code.slice('link-'.length);
+      for (const c of chars) {
+        expect(INVITE_CODE_ALPHABET).toContain(c);
+      }
+    }
+  });
+
+  test('produces distinct codes across many runs (no static seed)', () => {
+    // Not a true uniqueness proof, but a single duplicate in 200 runs
+    // would mean roughly 8-bit-of-entropy generation rather than the
+    // expected ~40-bit (8 chars from a 31-char alphabet).
+    const seen = new Set<string>();
+    for (let i = 0; i < 200; i++) {
+      seen.add(generateInviteCode());
+    }
+    expect(seen.size).toBe(200);
+  });
+});
+
+describe('queryLinearTeamKeys', () => {
+  // Returned keys are persisted on the registry row at install time and
+  // drive prefix-routing inside the screenshot processor — see #96. The
+  // helper never throws (a transient Linear outage during `setup` must not
+  // abort the OAuth dance), but it distinguishes success-with-keys from a
+  // network/auth/GraphQL failure via a discriminated result (#756 Cat 2) so
+  // the caller can warn instead of silently persisting "no teams". Coverage
+  // verifies (a) happy-path normalization, (b) an empty-but-valid workspace
+  // is `ok`, and (c) every failure mode surfaces `ok: false`.
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('uppercases, dedupes, and sorts the team keys returned by Linear', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          teams: {
+            nodes: [
+              { key: 'plat' },
+              { key: 'ABCA' },
+              { key: 'PLAT' }, // dedup case-insensitive
+              { key: 'web' },
+            ],
+          },
+        },
+      }),
+    }) as unknown as typeof fetch;
+
+    const result = await queryLinearTeamKeys('Bearer tok');
+
+    expect(result).toEqual({ ok: true, keys: ['ABCA', 'PLAT', 'WEB'] });
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.linear.app/graphql',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer tok' }),
+      }),
+    );
+  });
+
+  test('drops empty / non-string key entries', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          teams: {
+            nodes: [
+              { key: 'ABCA' },
+              { key: '' },
+              { key: undefined },
+              {}, // missing key entirely
+            ],
+          },
+        },
+      }),
+    }) as unknown as typeof fetch;
+
+    expect(await queryLinearTeamKeys('Bearer tok')).toEqual({ ok: true, keys: ['ABCA'] });
+  });
+
+  test('fails (ok: false) when Linear responds non-2xx', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    }) as unknown as typeof fetch;
+
+    const result = await queryLinearTeamKeys('Bearer tok');
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toBeInstanceOf(Error);
+  });
+
+  test('fails (ok: false) when fetch itself throws (network failure)', async () => {
+    const err = new Error('ECONNRESET');
+    global.fetch = jest.fn().mockRejectedValue(err) as unknown as typeof fetch;
+
+    expect(await queryLinearTeamKeys('Bearer tok')).toEqual({ ok: false, error: err });
+  });
+
+  // Linear's dominant auth/scope failure is NOT a non-2xx: it answers HTTP 200
+  // with an `errors` array and no `data`. A token minted without `read` team
+  // scope hits exactly this. Reading `data.teams.nodes ?? []` off that body was
+  // the masking #792 named for this site — "no teams" and "auth failed" became
+  // the same `keys: []`, the caller printed no warning, and every later issue
+  // lookup silently degraded to scanning every workspace.
+  test('fails (ok: false) on HTTP 200 with a GraphQL errors array — an unscoped token', async () => {
+    const errors = [{ message: 'Authentication required' }];
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ errors }),
+    }) as unknown as typeof fetch;
+
+    expect(await queryLinearTeamKeys('Bearer tok')).toEqual({ ok: false, error: errors });
+  });
+
+  // `errors` wins even when a partial `data` came back with it — a partial
+  // GraphQL result is not a team list we should persist as authoritative.
+  test('fails (ok: false) when errors accompany a partial data payload', async () => {
+    const errors = [{ message: 'Field "key" is restricted' }];
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { teams: { nodes: [{ key: 'ABCA' }] } }, errors }),
+    }) as unknown as typeof fetch;
+
+    expect(await queryLinearTeamKeys('Bearer tok')).toEqual({ ok: false, error: errors });
+  });
+
+  // A real workspace always returns the `teams` connection — empty when it has
+  // no teams. A body with no connection at all is malformed, not an empty
+  // workspace, so it must not be persisted as "this workspace has no teams".
+  test('fails (ok: false) when the response carries no teams connection', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: {} }),
+    }) as unknown as typeof fetch;
+
+    const result = await queryLinearTeamKeys('Bearer tok');
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toBeInstanceOf(Error);
+  });
+
+  // The one genuine empty: the connection is present and its node list is empty.
+  test('succeeds with no keys for a workspace that genuinely has no teams', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { teams: { nodes: [] } } }),
+    }) as unknown as typeof fetch;
+
+    expect(await queryLinearTeamKeys('Bearer tok')).toEqual({ ok: true, keys: [] });
+  });
+
+  // `nodes` omitted but the connection present — tolerated as empty, since the
+  // connection itself proves the query resolved.
+  test('succeeds with no keys when the teams connection omits nodes', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { teams: {} } }),
+    }) as unknown as typeof fetch;
+
+    expect(await queryLinearTeamKeys('Bearer tok')).toEqual({ ok: true, keys: [] });
+  });
+});
+
+describe('parsePastedAuthorization', () => {
+  // Restores the OAuth correlation check on the hosted path. When the round trip goes
+  // through a human copying a value, `state` is the only thing tying the pasted code
+  // to the authorization this machine started — without it, a code acquired elsewhere
+  // could be pasted in and exchanged, installing a grant nobody here initiated.
+  test('splits the code and state the consent page returns', () => {
+    expect(parsePastedAuthorization('code=abc123&state=st-9')).toEqual({ code: 'abc123', state: 'st-9' });
+  });
+
+  test('tolerates a leading question mark, as a copied URL fragment would have', () => {
+    expect(parsePastedAuthorization('?code=abc123&state=st-9')).toEqual({ code: 'abc123', state: 'st-9' });
+  });
+
+  test('a bare code parses, with NO state — the caller must not imply the check ran', () => {
+    expect(parsePastedAuthorization('abc123')).toEqual({ code: 'abc123' });
+  });
+
+  test('surrounding whitespace from a copy is stripped', () => {
+    expect(parsePastedAuthorization('  code=abc123&state=st-9  ')).toEqual({ code: 'abc123', state: 'st-9' });
+  });
+
+  test('a pair with an empty code yields an empty code, so callers can refuse it', () => {
+    expect(parsePastedAuthorization('code=&state=st-9').code).toBe('');
+  });
+
+  test('an empty state is reported as absent rather than as a value to compare', () => {
+    // Comparing against '' would make a stateless authorization look correlated.
+    expect(parsePastedAuthorization('code=abc123&state=')).toEqual({ code: 'abc123' });
+  });
+});

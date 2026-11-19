@@ -1,0 +1,110 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { CliError } from './errors';
+import { CliConfig, Credentials } from './types';
+
+const CONFIG_DIR_ENV = 'BGAGENT_CONFIG_DIR';
+const CONFIG_FILE = 'config.json';
+const CREDENTIALS_FILE = 'credentials.json';
+
+/** Owner-only read/write — credentials must never be group/world readable. */
+export const SECRET_FILE_MODE = 0o600;
+
+/** Returns the config directory path (~/.bgagent or BGAGENT_CONFIG_DIR). */
+export function getConfigDir(): string {
+  return process.env[CONFIG_DIR_ENV] || path.join(os.homedir(), '.bgagent');
+}
+
+function configPath(): string {
+  return path.join(getConfigDir(), CONFIG_FILE);
+}
+
+function credentialsPath(): string {
+  return path.join(getConfigDir(), CREDENTIALS_FILE);
+}
+
+function ensureConfigDir(): void {
+  const dir = getConfigDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+}
+
+/** Load CLI configuration. Throws if not configured. */
+export function loadConfig(): CliConfig {
+  const p = configPath();
+  if (!fs.existsSync(p)) {
+    throw new CliError('Not configured. Run `bgagent configure` first.');
+  }
+  return JSON.parse(fs.readFileSync(p, 'utf-8')) as CliConfig;
+}
+
+/** Save CLI configuration. */
+export function saveConfig(config: CliConfig): void {
+  ensureConfigDir();
+  fs.writeFileSync(configPath(), JSON.stringify(config, null, 2) + '\n', { mode: 0o644 });
+}
+
+/** Load existing CLI config if present, else return null (no error). */
+export function tryLoadConfig(): CliConfig | null {
+  const p = configPath();
+  if (!fs.existsSync(p)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8')) as CliConfig;
+  } catch {
+    return null; // nosemgrep: ts-silent-success-masking -- corrupt config file treated as absent; caller falls back to configure flow
+  }
+}
+
+/** Load cached credentials. Returns null if no credentials file exists.
+ *  A corrupt (non-JSON) credentials file throws a ``CliError`` pointing the
+ *  user at ``bgagent login`` rather than surfacing a raw ``SyntaxError``. */
+export function loadCredentials(): Credentials | null {
+  const p = credentialsPath();
+  if (!fs.existsSync(p)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8')) as Credentials;
+  } catch {
+    throw new CliError('Credentials file is corrupt. Run `bgagent login` to re-authenticate.');
+  }
+}
+
+/** Remove cached credentials, e.g. when the CLI is re-pointed at another stack's user pool. */
+export function clearCredentials(): void {
+  fs.rmSync(credentialsPath(), { force: true });
+}
+
+/** Save credentials with restricted permissions. */
+export function saveCredentials(creds: Credentials): void {
+  ensureConfigDir();
+  const p = credentialsPath();
+  fs.writeFileSync(p, JSON.stringify(creds, null, 2) + '\n', { mode: SECRET_FILE_MODE });
+  // writeFileSync only honors `mode` when CREATING the file; overwriting a
+  // pre-existing loose-permissions file leaves its bits untouched. chmod
+  // makes the 0600 intent durable across re-logins.
+  fs.chmodSync(p, SECRET_FILE_MODE);
+}

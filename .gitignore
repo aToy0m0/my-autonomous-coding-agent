@@ -1,0 +1,176 @@
+# ──────────────────────────────────────────────
+# Logs
+# ──────────────────────────────────────────────
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# ──────────────────────────────────────────────
+# Runtime / process
+# ──────────────────────────────────────────────
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# ──────────────────────────────────────────────
+# Coverage & test reports
+# ──────────────────────────────────────────────
+coverage
+agent/.coverage
+*.lcov
+# Codecov uploader binary + signature files downloaded by codecov-action at CI time
+codecov
+codecov.*
+.nyc_output
+.jest-cache
+*.tsbuildinfo
+lib-cov
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+/test-reports/
+junit.xml
+/coverage/
+
+# ──────────────────────────────────────────────
+# Node / JS
+# ──────────────────────────────────────────────
+node_modules/
+# Also match a SYMLINK named node_modules. The trailing-slash form above matches
+# directories only, so a symlink (e.g. one pointing at a shared install in
+# another worktree) slips past it and can be committed by `git add -A`. A
+# committed symlink then breaks CI at install time with EEXIST.
+node_modules
+jspm_packages/
+.eslintcache
+*.tgz
+.yarn-integrity
+.cache
+.parcel-cache/
+
+# ──────────────────────────────────────────────
+# Python
+# ──────────────────────────────────────────────
+*.pyc
+__pycache__/
+agent/.venv/
+
+# ──────────────────────────────────────────────
+# CDK / CloudFormation outputs
+# ──────────────────────────────────────────────
+cdk.out/
+/cdk/cdk.out*/
+/cdk/cdk-*.out/
+.cdk.staging/
+cdk.context.json
+/assets/
+
+# integ-runner snapshots: these bundle every Lambda handler asset (~100 MB) and
+# are regenerated on each run. CI always deploys-then-verifies (integ-runner
+# --force) rather than diffing a committed snapshot, so the snapshot is a build
+# artifact, not source. Also catch integ-runner's temp synth dir.
+/cdk/test/integ/*.snapshot/
+/cdk/test/integ/cdk-integ.out.*/
+
+# ──────────────────────────────────────────────
+# CI artifacts (generated during build)
+# ──────────────────────────────────────────────
+deploy-intent.json
+
+# ──────────────────────────────────────────────
+# Build outputs (compiled TS → JS)
+# ──────────────────────────────────────────────
+/cdk/lib/
+/cli/lib/
+/dist/
+build/Release
+
+# ──────────────────────────────────────────────
+# Docs build
+# ──────────────────────────────────────────────
+/docs/dist/
+local-docs/
+
+# ──────────────────────────────────────────────
+# IDE / editor
+# ──────────────────────────────────────────────
+.idea
+.vscode
+.DS_Store
+
+# ──────────────────────────────────────────────
+# Security scan outputs
+# ──────────────────────────────────────────────
+gitleaks-*.json
+agent/gitleaks-report.json
+
+# ──────────────────────────────────────────────
+# Environment / secrets
+# ──────────────────────────────────────────────
+.env
+.env.*
+.claude/settings.local.json
+
+# ──────────────────────────────────────────────
+# Claude Code plugins
+# ──────────────────────────────────────────────
+.mcp.json
+.remember/
+.claude/worktrees/
+
+# ──────────────────────────────────────────────
+# Misc
+# ──────────────────────────────────────────────
+*.bkp
+Plans/
+
+# draw.io editor artifacts
+.$*.drawio.bkp
+
+# ──────────────────────────────────────────────
+# Explicit keeps (override ignores above)
+# ──────────────────────────────────────────────
+!.node-version
+!.ort.yml
+!/.github/workflows/build.yml
+!/.github/workflows/docs.yml
+!/.github/pull_request_template.md
+!/.mergify.yml
+!/cdk/test/
+!/cdk/tsconfig.json
+!/cdk/tsconfig.dev.json
+!/cdk/src/
+!/cdk/.eslintrc.json
+/cdk/cdk.json
+
+# Local verification tools and private scratch data
+.tools/
+/_*/
+
+# Personal deployment inputs and internal working documents
+/abca.deployment.json
+/cdk/cdk.json
+/cdk/cdk.context.json
+/docs/personal/
+/docs/research/
+/README.upstream.md
+/README.public.md
+**/AGENTS.md
+**/CLAUDE.md
+/.claude/
+/.cursor/
+/.abca/
+/.devcontainer/
+/.github/
+/.threat-composer/
+/artifacts/
+/tmp/
+!**/.env.example
+!/abca.deployment.example.json
+!/cdk/cdk.example.json
+
+# Only the public user guide belongs in this distribution
+/docs/*
+!/docs/public-guide/

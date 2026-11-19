@@ -1,0 +1,662 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import { withDurableExecution, type DurableExecutionHandler } from '@aws/durable-execution-sdk-js';
+import { TaskStatus, TERMINAL_STATUSES } from '../constructs/task-status';
+import { resolveComputeStrategy, type SessionHandle } from './shared/compute-strategy';
+import { MicrovmStartUncertainError } from './shared/error-classifier';
+import { reportIssueFailure as reportJiraIssueFailure } from './shared/jira-feedback';
+import { reportIssueFailure } from './shared/linear-feedback';
+import { logger } from './shared/logger';
+import { stopMicrovmWithDiagnostics } from './shared/microvm/supervisor';
+import { pollMicrovmTask } from './shared/microvm/task-poll';
+import {
+  admissionControl,
+  buildComputeMetadata,
+  emitTaskEvent,
+  envelopeFor,
+  failTask,
+  finalizeTask,
+  hydrateAndTransition,
+  loadBlueprintConfig,
+  loadTask,
+  pollTaskStatus,
+  queueTask,
+  transitionTask,
+  type PollState,
+} from './shared/orchestrator';
+import { runPreflightChecks } from './shared/preflight';
+import { isAutoRetried, startSessionWithRetry } from './shared/session-start-retry';
+import { deleteEcsPayload } from './shared/strategies/ecs-strategy';
+import { deleteMicrovmPayload } from './shared/strategies/lambda-microvm-strategy';
+import type { TaskRecord } from './shared/types';
+import { workflowIsReadOnly, workflowRequiresRepo } from './shared/workflows';
+
+interface OrchestrateTaskEvent {
+  readonly task_id: string;
+  /**
+   * Per-pickup nonce set by the admission-queue pickup Lambda (#441)
+   * when re-invoking after a QUEUED -> SUBMITTED flip. Unused by the
+   * handler; it exists so the re-invoke payload differs from the
+   * original create-task invocation and no layer (Lambda async dedup,
+   * durable-execution idempotency) can mistake it for a replay.
+   */
+  readonly queue_pickup_id?: string;
+}
+
+/**
+ * A MicroVM start that failed before registration. The start step never retries
+ * (a retry could launch a second computer), so it returns the failure and a
+ * separate retried step records it.
+ */
+interface MicrovmStartFailure {
+  readonly microvmStartFailure: { readonly fromStatus: TaskRecord['status']; readonly errorMessage: string };
+}
+type StartSessionResult = SessionHandle | MicrovmStartFailure | null;
+
+function isMicrovmStartFailure(result: StartSessionResult): result is MicrovmStartFailure {
+  return result !== null && 'microvmStartFailure' in result;
+}
+
+const MAX_POLL_ATTEMPTS = 1020; // ~8.5h at 30s intervals
+const MAX_NON_RUNNING_POLLS = 10; // ~5min grace period for session to start
+const MAX_CONSECUTIVE_ECS_POLL_FAILURES = 3;
+const MAX_CONSECUTIVE_ECS_COMPLETED_POLLS = 5;
+/** Poll cadence when the blueprint doesn't override ``poll_interval_ms`` (seconds). */
+const DEFAULT_POLL_INTERVAL_SECONDS = 30;
+
+const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = async (event, context) => {
+  const { task_id: taskId } = event;
+
+  // Step 1: Load task record
+  const task = await context.step('load-task', async () => {
+    return loadTask(taskId);
+  });
+
+  // Correlation envelope: stamp {task_id, user_id, repo} on every lifecycle log
+  // line so admission→terminal transitions join to TaskEvents and the agent
+  // trace without hand-adding fields per call. `repo` is undefined for repo-less
+  // workflows (those with no target repository).
+  const { log, correlation } = envelopeFor(task);
+
+  // Step 1b: Load blueprint config (per-repo overrides)
+  const blueprintConfig = await context.step('load-blueprint', async () => {
+    try {
+      return await loadBlueprintConfig(task);
+    } catch (err) {
+      await failTask(taskId, task.status, `Blueprint config load failed: ${String(err)}`, task.user_id, false, task.repo);
+      throw err;
+    }
+  });
+
+  // Step 2: Admission control — check concurrency limit. At capacity the
+  // task is QUEUED (durable, FIFO on created_at) instead of FAILED (#441):
+  // the admission-queue pickup Lambda re-attempts admission as slots free
+  // up, flips QUEUED -> SUBMITTED, and re-invokes this orchestrator.
+  const admitted = await context.step('admission-control', async () => {
+    // Re-read status to detect external cancellation between steps
+    const current = await loadTask(taskId, true);
+    if (TERMINAL_STATUSES.includes(current.status)) {
+      return false;
+    }
+    const result = await admissionControl(task);
+    if (!result) {
+      // Re-read for queue bookkeeping: `task` is the step-1 snapshot, but a
+      // pickup-cycle re-queue must preserve the CURRENT queued_at /
+      // admission_attempts, which the pickup Lambda may have advanced.
+      // queueTask emits the `admission_queued` event itself.
+      await queueTask(current);
+      // Channel feedback only on the FIRST queue entry — a pickup-cycle
+      // re-queue (lost admission race) would otherwise spam the issue with
+      // one comment per cycle. Non-fatal: a throw here would re-run
+      // queueTask on the durable-execution retry, producing duplicate events.
+      if (current.queued_at === undefined) {
+        try {
+          await notifyLinearOnConcurrencyCap(task);
+        } catch (err) {
+          log.warn('Linear concurrency-cap feedback failed (non-fatal)', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        try {
+          await notifyJiraOnConcurrencyCap(task);
+        } catch (err) {
+          log.warn('Jira concurrency-cap feedback failed (non-fatal)', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+    return result;
+  });
+
+  if (!admitted) {
+    return;
+  }
+
+  // Step 2b: Pre-flight checks — verify external dependencies before consuming AgentCore runtime
+  const preflightPassed = await context.step('pre-flight', async () => {
+    try {
+      const current = await loadTask(taskId, true);
+      if (TERMINAL_STATUSES.includes(current.status)) {
+        return false;
+      }
+      const workflowId = task.resolved_workflow?.id ?? 'coding/new-task-v1';
+      const result = await runPreflightChecks(
+        task.repo,
+        blueprintConfig,
+        task.pr_number,
+        workflowIsReadOnly(workflowId),
+        workflowRequiresRepo(workflowId),
+      );
+      if (!result.passed) {
+        const errorMessage = `Pre-flight check failed: ${result.failureReason}${result.failureDetail ? ' — ' + result.failureDetail : ''}`;
+        await failTask(taskId, current.status, errorMessage, task.user_id, true, task.repo);
+        await emitTaskEvent(taskId, 'preflight_failed', {
+          reason: result.failureReason,
+          detail: result.failureDetail,
+          checks: result.checks,
+        }, correlation);
+      }
+      return result.passed;
+    } catch (err) {
+      await failTask(taskId, task.status, `Pre-flight failed: ${String(err)}`, task.user_id, true, task.repo);
+      throw err;
+    }
+  });
+
+  if (!preflightPassed) {
+    return;
+  }
+
+  // Step 3: Context hydration — assemble payload and transition to HYDRATING
+  const payload = await context.step('hydrate-context', async () => {
+    try {
+      return await hydrateAndTransition(task, blueprintConfig);
+    } catch (err) {
+      // Hydration may fail due to external cancellation, guardrail blocking, or guardrail API failure — fail the task and release concurrency
+      await failTask(taskId, TaskStatus.HYDRATING, `Hydration failed: ${String(err)}`, task.user_id, true, task.repo);
+      throw err;
+    }
+  });
+
+  // Step 4: Start agent session — resolve compute strategy, invoke runtime, transition to RUNNING
+  // Returns the full SessionHandle (serializable) so ECS polling can use it in step 5.
+  const startResult: StartSessionResult = await context.step('start-session', async (): Promise<StartSessionResult> => {
+    let autoRetried = false;
+    let failureStatus: TaskRecord['status'] = TaskStatus.HYDRATING;
+    // Hoisted out of the `try` so the catch can reap a MicroVM that STARTED but
+    // whose registration did not complete — see the catch block.
+    let strategy: ReturnType<typeof resolveComputeStrategy> | undefined;
+    let startedHandle: Awaited<ReturnType<typeof startSessionWithRetry>>['handle'] | undefined;
+    try {
+      strategy = resolveComputeStrategy(blueprintConfig);
+      const startInput = {
+        taskId,
+        userId: task.user_id,
+        payload,
+        blueprintConfig,
+        // A read-only workflow (e.g. planning that only clones and reads the
+        // repo) runs on the smaller ECS planning task def. Ignored by AgentCore.
+        readOnly: workflowIsReadOnly(task.resolved_workflow?.id ?? 'coding/new-task-v1'),
+      };
+      // Transient-error AUTO-RETRY (once), extracted to startSessionWithRetry so
+      // its branches are unit-tested. The retry-event emit is best-effort and
+      // guarded there: a TaskEvents PutItem fault can't abort or mis-attribute
+      // the retry. The correlation envelope is threaded so the
+      // session_start_retry event carries the same trace context as
+      // session_started below.
+      const { handle, autoRetried: retried } = await startSessionWithRetry(
+        strategy,
+        startInput,
+        {
+          emitRetryEvent: (reason) =>
+            emitTaskEvent(taskId, 'session_start_retry', { reason }, correlation),
+          logger,
+          taskId,
+        },
+      );
+      autoRetried = retried;
+      startedHandle = handle;
+
+      // Build compute metadata for the task record so cancel-task can stop the
+      // right backend (and, for lambda-microvm, so the P3 approve/deny Lambdas
+      // can load the handle they resume from — ADR-021 sub-decision 2).
+      const computeMetadata = buildComputeMetadata(handle);
+
+      const current = handle.strategyType === 'lambda-microvm' ? await loadTask(taskId, true) : undefined;
+      if (current && TERMINAL_STATUSES.includes(current.status)) {
+        await strategy.stopSession(handle);
+        return null;
+      }
+      const alreadyRegistered = current?.session_id === handle.sessionId
+        && (current.status === TaskStatus.RUNNING || current.status === TaskStatus.AWAITING_APPROVAL);
+      if (alreadyRegistered) return handle;
+
+      await transitionTask(taskId, TaskStatus.HYDRATING, TaskStatus.RUNNING, {
+        session_id: handle.sessionId,
+        started_at: new Date().toISOString(),
+        compute_type: handle.strategyType,
+        compute_metadata: computeMetadata,
+        ...(handle.strategyType === 'agentcore' && { agent_runtime_arn: handle.runtimeArn }),
+      });
+      // A MicroVM's session_started is its own durable step below: the guest can
+      // mark the task RUNNING before this point, and the event must not depend
+      // on which writer got there first.
+      if (handle.strategyType !== 'lambda-microvm') {
+        await emitTaskEvent(taskId, 'session_started', {
+          session_id: handle.sessionId,
+          strategy_type: handle.strategyType,
+        }, correlation);
+      }
+
+      log.info('Session started', {
+        session_id: handle.sessionId,
+        strategy_type: handle.strategyType,
+      });
+
+      return handle;
+    } catch (err) {
+      if (blueprintConfig.compute_type === 'lambda-microvm') {
+        try {
+          const current = await loadTask(taskId, true);
+          // A lost DynamoDB update response does not undo its committed result.
+          if (startedHandle && current.session_id === startedHandle.sessionId
+            && (current.status === TaskStatus.RUNNING || current.status === TaskStatus.AWAITING_APPROVAL)) {
+            return startedHandle;
+          }
+          if (TERMINAL_STATUSES.includes(current.status)) {
+            if (startedHandle && strategy) await strategy.stopSession(startedHandle);
+            if (!startedHandle && err instanceof MicrovmStartUncertainError) {
+              log.error('Task became terminal while its MicroVM start outcome is unknown', {
+                task_id: taskId, client_token: taskId, task_status: current.status,
+              });
+              try {
+                await emitTaskEvent(taskId, 'microvm_start_outcome_unknown', {
+                  client_token: taskId, task_status: current.status,
+                }, correlation);
+              } catch (eventErr) {
+                log.warn('Could not record the unknown MicroVM start event', { error: String(eventErr) });
+              }
+            }
+            return null;
+          }
+          failureStatus = current.status;
+        } catch (readErr) {
+          log.warn('Could not reconcile MicroVM registration after start failure', { error: String(readErr) });
+        }
+      }
+      // Registration failed and a strong read could not establish a committed
+      // RUNNING/approval-wait task. Reap the known computer. The start receipt
+      // retains its ID for recovery if cleanup itself fails; the service's
+      // eight-hour maximum duration remains the final lifetime bound.
+      //
+      // Best-effort in the strongest sense: `stopSession` is internally
+      // non-throwing for this backend, and the extra try/catch guarantees that
+      // even a surprise (a non-microvm strategy, a synchronous throw) cannot
+      // replace the ORIGINAL failure — which is the one the user needs to see.
+      //
+      // Scoped to `lambda-microvm` deliberately. ECS and AgentCore have the same
+      // structural window, but generalising here would issue `StopTask` /
+      // `StopRuntimeSession` calls the ORCHESTRATOR role may not be granted (those
+      // grants live on the cancel Lambda), turning a clean failure into a clean
+      // failure plus a misleading AccessDenied. Widening it is a follow-up that
+      // needs the IAM change reviewed alongside.
+      if (startedHandle?.strategyType === 'lambda-microvm' && strategy) {
+        try {
+          log.warn('Session start failed after the MicroVM was created — terminating the orphan', {
+            microvm_id: startedHandle.microvmId,
+            original_error: err instanceof Error ? err.message : String(err),
+          });
+          await strategy.stopSession(startedHandle);
+        } catch (reapErr) {
+          log.error('Failed to terminate the orphaned MicroVM — it may bill until its 8h cap', {
+            microvm_id: startedHandle.microvmId,
+            error: reapErr instanceof Error ? reapErr.message : String(reapErr),
+          });
+        }
+      }
+
+      // Carry the auto-retry fact into error_message: the `[auto-retried]` suffix
+      // is persisted verbatim (the error classifier ignores it — it does not
+      // affect classification). It is a breadcrumb for a failure renderer to
+      // detect and surface "I already tried again" to the channel.
+      //
+      // Stamp on BOTH paths where a retry ran: one path sets `autoRetried` above
+      // then a LATER step throws; the transient-then-transient path throws FROM
+      // startSessionWithRetry before `autoRetried` is assigned, so the local is
+      // still false — read the fact off the thrown error via isAutoRetried().
+      // Without this, a double-transient failure was told "reply to retry" instead
+      // of "I already retried" — the exact confusion the marker exists to prevent.
+      const retriedNote = (autoRetried || isAutoRetried(err)) ? ' [auto-retried]' : '';
+      const detail = err instanceof MicrovmStartUncertainError
+        ? `MICROVM_START_OUTCOME_UNKNOWN: ${String(err)}`
+        : String(err);
+      const errorMessage = `Session start failed: ${detail}${retriedNote}`;
+      if (blueprintConfig.compute_type === 'lambda-microvm') {
+        // This step never retries, so it cannot launch twice. Record FAILED here
+        // too, so a re-run of this step sees the closed task and launches
+        // nothing; a transient write error must not fail the step, so the
+        // retried `record-start-failure` step below makes the write stick. The
+        // terminal event and seat release stay with finalization.
+        try {
+          await transitionTask(taskId, failureStatus, TaskStatus.FAILED, {
+            completed_at: new Date().toISOString(), error_message: errorMessage,
+          });
+        } catch (transitionErr) {
+          log.warn('Could not record the MicroVM start failure yet; a retried step records it', {
+            error: String(transitionErr),
+          });
+        }
+        return { microvmStartFailure: { fromStatus: failureStatus, errorMessage } };
+      }
+      await failTask(taskId, failureStatus, errorMessage, task.user_id, true, task.repo);
+      throw err;
+    }
+  }, blueprintConfig.compute_type === 'lambda-microvm'
+    ? { retryStrategy: () => ({ shouldRetry: false }) }
+    : undefined);
+
+  if (isMicrovmStartFailure(startResult)) {
+    const { fromStatus, errorMessage } = startResult.microvmStartFailure;
+    await context.step('record-start-failure', async () => {
+      try {
+        await transitionTask(taskId, fromStatus, TaskStatus.FAILED, {
+          completed_at: new Date().toISOString(), error_message: errorMessage,
+        });
+      } catch (transitionErr) {
+        const current = await loadTask(taskId, true);
+        if (!TERMINAL_STATUSES.includes(current.status)) throw transitionErr;
+      }
+    });
+  }
+  const sessionHandle = isMicrovmStartFailure(startResult) ? null : startResult;
+
+  if (sessionHandle?.strategyType === 'lambda-microvm') {
+    // Once per execution, after either writer registered the worker.
+    await context.step('session-started-event', async () => {
+      try {
+        await emitTaskEvent(taskId, 'session_started', {
+          session_id: sessionHandle.sessionId,
+          strategy_type: sessionHandle.strategyType,
+        }, correlation);
+      } catch (emitErr) {
+        log.warn('session_started event failed after the MicroVM was registered', {
+          session_id: sessionHandle.sessionId, error: String(emitErr),
+        });
+      }
+    });
+  }
+
+  if (!sessionHandle) {
+    // The task ended before registration, including a persisted start failure.
+    // Reach normal finalization without starting another VM.
+    await context.step('finalize-before-session', async () => {
+      await finalizeTask(taskId, { attempts: 0 }, task.user_id);
+      await deleteMicrovmPayload(taskId);
+    });
+    return;
+  }
+
+  // Resolve the compute strategy once and reuse it across poll iterations
+  // instead of constructing a new instance on every cycle.
+  const computeStrategy = blueprintConfig.compute_type === 'ecs'
+    ? resolveComputeStrategy(blueprintConfig)
+    : undefined;
+
+  // ECS crash checks and MicroVM lifecycle supervision have separate policies.
+  const microvmStrategy = blueprintConfig.compute_type === 'lambda-microvm'
+    ? resolveComputeStrategy(blueprintConfig)
+    : undefined;
+
+  // Step 5: Wait for agent to finish
+  // Polls DynamoDB on each interval. The agent writes terminal status when done.
+  // While RUNNING, the runtime updates `agent_heartbeat_at`; if that timestamp
+  // goes stale, `pollTaskStatus` sets `sessionUnhealthy` so we fail fast instead
+  // of waiting the full MAX_POLL_ATTEMPTS window (~8.5h) after a silent crash.
+  // ECS/AgentCore retain their poll-count startup/total bounds. MicroVM uses
+  // persisted wall-clock deadlines so faster transition polls cannot shorten a session.
+
+  const finalPollState = await context.waitForCondition<PollState>(
+    'await-agent-completion',
+    async (state) => {
+      if (microvmStrategy && sessionHandle.strategyType === 'lambda-microvm') {
+        return pollMicrovmTask({
+          taskId,
+          userId: task.user_id,
+          handle: sessionHandle,
+          strategy: microvmStrategy,
+          pollIntervalMs: blueprintConfig.poll_interval_ms ?? DEFAULT_POLL_INTERVAL_SECONDS * 1000,
+          suspendEnabled: process.env.MICROVM_APPROVAL_SUSPEND_ENABLED === 'true',
+          emitEvent: (type, metadata, options) => emitTaskEvent(taskId, type, metadata, correlation, options),
+        }, state);
+      }
+      const ddbState = await pollTaskStatus(taskId, state, blueprintConfig.compute_type);
+      let consecutiveEcsPollFailures = 0;
+      let consecutiveEcsCompletedPolls = 0;
+      // ECS compute-level crash detection: if DDB is not terminal, check ECS task status
+      if (
+        ddbState.lastStatus &&
+        !TERMINAL_STATUSES.includes(ddbState.lastStatus) &&
+        computeStrategy
+      ) {
+        try {
+          const ecsStatus = await computeStrategy.pollSession(sessionHandle);
+          if (ecsStatus.status === 'failed') {
+            const errorMsg = 'error' in ecsStatus ? ecsStatus.error : 'ECS task failed';
+            log.warn('ECS task failed before DDB terminal write', {
+              error: errorMsg,
+            });
+            await failTask(taskId, ddbState.lastStatus, `ECS container failed: ${errorMsg}`, task.user_id, false, task.repo);
+            return { attempts: ddbState.attempts, lastStatus: TaskStatus.FAILED };
+          }
+          if (ecsStatus.status === 'completed') {
+            consecutiveEcsCompletedPolls = (state.consecutiveEcsCompletedPolls ?? 0) + 1;
+            if (consecutiveEcsCompletedPolls >= MAX_CONSECUTIVE_ECS_COMPLETED_POLLS) {
+              // ECS task exited successfully but DDB never reached terminal — the agent
+              // likely crashed after container exit code 0 but before writing status.
+              log.error('ECS task completed but DDB never caught up — failing task', {
+                consecutive_completed_polls: consecutiveEcsCompletedPolls,
+              });
+              await failTask(taskId, ddbState.lastStatus, `ECS task exited successfully but agent never wrote terminal status after ${consecutiveEcsCompletedPolls} polls`, task.user_id, false, task.repo);
+              return { attempts: ddbState.attempts, lastStatus: TaskStatus.FAILED };
+            }
+            log.warn('ECS task completed but DDB not terminal — waiting for DDB catchup', {
+              consecutive_completed_polls: consecutiveEcsCompletedPolls,
+            });
+          }
+        } catch (err) {
+          consecutiveEcsPollFailures = (state.consecutiveEcsPollFailures ?? 0) + 1;
+          if (consecutiveEcsPollFailures >= MAX_CONSECUTIVE_ECS_POLL_FAILURES) {
+            log.error('ECS pollSession failed repeatedly — failing task', {
+              consecutive_failures: consecutiveEcsPollFailures,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            await failTask(taskId, ddbState.lastStatus, `ECS poll failed ${consecutiveEcsPollFailures} consecutive times: ${err instanceof Error ? err.message : String(err)}`, task.user_id, false, task.repo);
+            return { attempts: ddbState.attempts, lastStatus: TaskStatus.FAILED };
+          }
+          log.warn('ECS pollSession check failed (non-fatal)', {
+            consecutive_failures: consecutiveEcsPollFailures,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return { ...ddbState, consecutiveEcsPollFailures, consecutiveEcsCompletedPolls };
+    },
+    {
+      initialState: { attempts: 0 },
+      waitStrategy: (state: PollState) => {
+        if (state.microvmOwnershipLost) return { shouldContinue: false };
+        if (state.lastStatus && TERMINAL_STATUSES.includes(state.lastStatus)) {
+          return { shouldContinue: false };
+        }
+        if (state.sessionUnhealthy) {
+          return { shouldContinue: false };
+        }
+        if (state.microvmSupervisor) {
+          if (state.microvmFailureReason || state.microvmOwnershipLost) return { shouldContinue: false };
+          return {
+            shouldContinue: true,
+            delay: { seconds: Math.max(1, Math.ceil(state.microvmSupervisor.nextPollInMs / 1000)) },
+          };
+        }
+        if (state.attempts >= MAX_POLL_ATTEMPTS) {
+          return { shouldContinue: false };
+        }
+        // If the task is still HYDRATING after a grace period, the session never
+        // started (e.g. container crash). Stop polling early so finalizeTask can
+        // transition to FAILED instead of waiting 8.5h.
+        if (state.attempts >= MAX_NON_RUNNING_POLLS && state.lastStatus === TaskStatus.HYDRATING) {
+          return { shouldContinue: false };
+        }
+        const pollSeconds = blueprintConfig.poll_interval_ms
+          ? Math.ceil(blueprintConfig.poll_interval_ms / 1000)
+          : DEFAULT_POLL_INTERVAL_SECONDS;
+        return { shouldContinue: true, delay: { seconds: pollSeconds } };
+      },
+    },
+  );
+
+  // Step 6: Finalize — update terminal status, emit events, release concurrency
+  await context.step('finalize', async () => {
+    let finalized = false;
+    try {
+      if (!finalPollState.microvmOwnershipLost) {
+        finalized = (await finalizeTask(taskId, finalPollState, task.user_id)) !== false;
+      }
+    } finally {
+      // Even a database finalization failure must not lose cleanup of this handle.
+      if (microvmStrategy && sessionHandle.strategyType === 'lambda-microvm') {
+        await stopMicrovmWithDiagnostics({
+          taskId,
+          handle: sessionHandle,
+          strategy: microvmStrategy,
+          emitEvent: (type, metadata, options) => emitTaskEvent(taskId, type, metadata, correlation, options),
+        });
+      }
+    }
+    if (!finalized) return;
+    // The task is terminal and the substrate has read its payload: delete the
+    // ephemeral S3 payload object. Best-effort; the bucket lifecycle rule is the
+    // backstop. The MicroVM execution role can read the whole payload bucket, so
+    // prompt deletion at finalize (not TTL alone) limits cross-task exposure.
+    if (blueprintConfig.compute_type === 'ecs') {
+      await deleteEcsPayload(taskId);
+    } else if (blueprintConfig.compute_type === 'lambda-microvm') {
+      await deleteMicrovmPayload(taskId);
+    }
+  });
+};
+
+export const handler = withDurableExecution(durableHandler);
+
+/**
+ * Post a Linear comment when admission control queues a task on the user
+ * concurrency cap (#441). Linear-only; silently no-ops for other channels.
+ *
+ * The processor side (`linear-webhook-processor.ts`) already covers
+ * pre-`createTaskCore` rejections (unmapped project, unlinked actor, guardrail);
+ * this hook covers the post-201 case where the orchestrator queues on
+ * admission. Without this, the only Linear-side signal would be the 👀
+ * reaction the agent never gets to add — looks like the integration silently
+ * dropped the request.
+ *
+ * Best-effort: errors inside `reportIssueFailure` are swallowed at the helper
+ * layer; we don't surface them here because Linear feedback must never block
+ * the rejection path.
+ *
+ * Exported for unit testing — the durable handler invokes it inline.
+ */
+export async function notifyLinearOnConcurrencyCap(task: TaskRecord): Promise<void> {
+  if (task.channel_source !== 'linear') return;
+  const issueId = task.channel_metadata?.linear_issue_id;
+  const linearWorkspaceId = task.channel_metadata?.linear_workspace_id;
+  if (!issueId || !linearWorkspaceId) return;
+  const registryTableName = process.env.LINEAR_WORKSPACE_REGISTRY_TABLE_NAME;
+  if (!registryTableName) {
+    logger.warn('Skipping Linear concurrency-cap feedback: LINEAR_WORKSPACE_REGISTRY_TABLE_NAME not set', {
+      task_id: task.task_id,
+    });
+    return;
+  }
+  // Wrap in try/catch matching the `safeReportIssueFailure` pattern in
+  // the webhook processor. `reportIssueFailure` itself is best-effort
+  // internally, but a synchronous throw bubbling up here would crash the
+  // durable-execution step on a transient DDB throttle during the
+  // workspace registry lookup. Suppress + log so the rejection path is
+  // never blocked by Linear-feedback failures.
+  try {
+    await reportIssueFailure(
+      { linearWorkspaceId, registryTableName },
+      issueId,
+      '⏸️ ABCA hit your concurrency limit — this task has been queued and will start automatically when a slot frees up. No action needed.',
+    );
+  } catch (err) {
+    logger.warn('Linear concurrency-cap feedback failed (non-fatal)', {
+      task_id: task.task_id,
+      linear_workspace_id: linearWorkspaceId,
+      issue_id: issueId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Post a Jira issue comment when admission control queues a task on the
+ * user concurrency cap (#441). Jira-only; silently no-ops for other channels.
+ *
+ * Parity with {@link notifyLinearOnConcurrencyCap}: the webhook processor
+ * covers pre-`createTaskCore` rejections (unmapped project, unlinked actor,
+ * guardrail), while this hook covers the post-201 case where the orchestrator
+ * queues on admission. Without it, a Jira user who hits the cap sees the
+ * integration silently drop the request (the agent — which would otherwise
+ * comment — never starts).
+ *
+ * Best-effort: `reportIssueFailure` swallows its own errors; we wrap in
+ * try/catch anyway because a transient throw during the registry lookup must
+ * never block the rejection path. Exported for unit testing.
+ */
+export async function notifyJiraOnConcurrencyCap(task: TaskRecord): Promise<void> {
+  if (task.channel_source !== 'jira') return;
+  const cloudId = task.channel_metadata?.jira_cloud_id;
+  const issueKey = task.channel_metadata?.jira_issue_key;
+  if (!cloudId || !issueKey) return;
+  const registryTableName = process.env.JIRA_WORKSPACE_REGISTRY_TABLE_NAME;
+  if (!registryTableName) {
+    logger.warn('Skipping Jira concurrency-cap feedback: JIRA_WORKSPACE_REGISTRY_TABLE_NAME not set', {
+      task_id: task.task_id,
+    });
+    return;
+  }
+  try {
+    await reportJiraIssueFailure(
+      { cloudId, registryTableName },
+      issueKey,
+      '⏸️ ABCA hit your concurrency limit — this task has been queued and will start automatically when a slot frees up. No action needed.',
+    );
+  } catch (err) {
+    logger.warn('Jira concurrency-cap feedback failed (non-fatal)', {
+      task_id: task.task_id,
+      jira_cloud_id: cloudId,
+      issue_key: issueKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}

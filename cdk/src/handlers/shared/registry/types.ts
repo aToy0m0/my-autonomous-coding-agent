@@ -1,0 +1,229 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+// Substrate-neutral domain types for the agent asset registry (#246). These are
+// the types the `RegistryClient` port speaks — nothing here references Agent Registry
+// or the AWS SDK. The substrate mapping lives in agent-registry-client.ts.
+//
+// API *wire* types shared with the CLI live in ../types.ts (types-sync contract);
+// these port-internal types are deliberately kept out of that sync.
+
+/** Canonical record status. Mirrors Agent Registry's `RegistryRecordStatus` tokens so
+ *  the resolver's status filter is spelled identically on both sides. Only
+ *  `APPROVED` resolves; `DEPRECATED` resolves with a warning. */
+export type RegistryStatus =
+  | 'CREATING'
+  | 'DRAFT'
+  | 'PENDING_APPROVAL'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'DEPRECATED'
+  | 'UPDATING'
+  | 'CREATE_FAILED'
+  | 'UPDATE_FAILED';
+
+/** How a record's runtime payload is stored on the substrate. */
+export type StorageMode = 'native' | 'custom';
+
+/** The reverse-DNS key under which ABCA runtime config rides inside a native
+ *  MCP `server.json` `_meta` block (spike-verified to survive validation). */
+export const RUNTIME_META_KEY = 'dev.abca.runtime';
+
+/** Companion `_meta` key carrying the authenticated publisher (Cognito sub) so
+ *  the record's origin is reconstructable — CloudTrail only sees the shared
+ *  Lambda role. Written once at publish; immutable with the rest of the record. */
+export const PUBLISHER_META_KEY = 'dev.abca.publisher';
+
+/** Frontmatter key carrying the publisher inside a native SKILL record's SKILL.md
+ *  (skills can't hold a `_meta` block). */
+export const PUBLISHER_FM_KEY = 'x-abca-publisher';
+
+// --- Per-kind runtime payloads -------------------------------------------------
+// The loadable body each kind carries, independent of discovery metadata.
+
+/** mcp_server: the `.mcp.json` connection config the agent merges in. */
+export interface McpRuntimePayload {
+  readonly transport: 'http' | 'sse' | 'stdio';
+  readonly url?: string;
+  readonly command?: string;
+  readonly args?: readonly string[];
+  readonly headers?: Readonly<Record<string, string>>;
+  /** Tools surface under this prefix (e.g. `mcp__example__`). */
+  readonly tool_prefix?: string;
+}
+
+/** cedar_policy_module: Cedar policy source text. */
+export interface CedarRuntimePayload {
+  readonly cedar_text: string;
+}
+
+/** skill: the prompt fragment appended to the system prompt (+ advisory hints). */
+export interface SkillRuntimePayload {
+  readonly prompt_fragment: string;
+  readonly tool_hints?: readonly string[];
+}
+
+export type RuntimePayload =
+  | McpRuntimePayload
+  | CedarRuntimePayload
+  | SkillRuntimePayload;
+
+/** A full registry record as the port sees it — discovery + runtime + status. */
+export interface RegistryRecord {
+  readonly kind: string;
+  readonly namespace: string;
+  readonly name: string;
+  readonly version: string;
+  readonly status: RegistryStatus;
+  readonly storageMode: StorageMode;
+  /** Discovery descriptor (server.json / SKILL.md / arbitrary) — validated body. */
+  readonly discovery: Readonly<Record<string, unknown>>;
+  /** ABCA runtime payload (from `_meta` or the CUSTOM body). */
+  readonly runtime: RuntimePayload;
+  readonly publisher?: string;
+  readonly createdAt?: string;
+}
+
+/** A record as a browse surface (`show`) sees it: either fully parsed, or a
+ *  marker that a record exists at these coordinates but its descriptor payload
+ *  did not parse. The envelope coordinates (name/version/status) stay readable
+ *  even when the payload is corrupt, so `show` can surface the version — flagged
+ *  as malformed — instead of dropping it and 404-ing an asset whose only
+ *  versions are corrupt (#791). */
+export type RegistryBrowseEntry =
+  | { readonly malformed: false; readonly record: RegistryRecord }
+  | {
+    readonly malformed: true;
+    readonly kind: string;
+    readonly namespace: string;
+    readonly name: string;
+    readonly version: string;
+    readonly status: RegistryStatus;
+  };
+
+/** What the resolver hands back for one ref: enough to load the asset without the
+ *  caller knowing where the bytes live. */
+export interface ResolvedAsset {
+  readonly kind: string;
+  readonly namespace: string;
+  readonly name: string;
+  readonly version: string;
+  readonly runtime: RuntimePayload;
+  /** Non-fatal advisories, e.g. `["DEPRECATED"]`. */
+  readonly warnings: readonly string[];
+}
+
+export type ResolutionFailureReason =
+  | 'NO_MATCHING_VERSION'
+  | 'REMOVED'
+  | 'MALFORMED'
+  | 'INVALID_CONSTRAINT'
+  | 'INVALID_REGISTRY_REF';
+
+export class RegistryResolutionError extends Error {
+  constructor(
+    readonly reason: ResolutionFailureReason,
+    readonly ref: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RegistryResolutionError';
+  }
+}
+
+/** Which stage of descriptor decoding failed. Every arm is a *present but
+ *  unparseable* payload — the discriminator lets a reader tell YAML-frontmatter
+ *  corruption apart from a bad `x-abca-runtime` value or a non-JSON CUSTOM/MCP
+ *  body without re-inspecting the cause. */
+export type MalformedReason =
+  // MALFORMED_FRONTMATTER: SKILL.md frontmatter block failed to YAML-parse.
+  // MALFORMED_RUNTIME: `x-abca-runtime` value is not decodable base64/JSON.
+  // MALFORMED_DESCRIPTOR: CUSTOM or MCP descriptor body is not valid JSON.
+  | 'MALFORMED_FRONTMATTER'
+  | 'MALFORMED_RUNTIME'
+  | 'MALFORMED_DESCRIPTOR';
+
+/**
+ * Raised when a record's descriptor payload is present but unparseable — a
+ * SKILL.md frontmatter block that fails to YAML-parse, an `x-abca-runtime` value
+ * that is not decodable base64/JSON, or a CUSTOM/MCP body that is not valid JSON
+ * (see {@link MalformedReason}). Distinct from an *absent* record and from an
+ * *empty* runtime: a malformed payload must be rejected, not silently collapsed
+ * to `{}`. Collapsing erases the publisher (attribution) and runtime, making a
+ * malformed record indistinguishable from a legitimately empty one and letting
+ * attacker-influenced input drop an audit-critical trust field (#791). The
+ * frontmatter-injection defense itself (#246 review B1/B2) lives on the *write*
+ * side — `buildSkillMd` emits every value through a YAML dumper that
+ * quotes/escapes newlines, so no discovery field can smuggle a shadowing key;
+ * surfacing a genuine parse failure here is about not masking corruption, not
+ * about the injection defense. Mirrors `RegistryRecordMalformedError` in
+ * `agent/src/registry/client.py`.
+ */
+export class RegistryRecordMalformedError extends Error {
+  constructor(
+    readonly reason: MalformedReason,
+    message: string,
+    override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'RegistryRecordMalformedError';
+  }
+}
+
+/**
+ * Raised when `publish` succeeds at CreateRegistryRecord but a later step
+ * (submit/approve/re-read) fails, leaving a partial record on the substrate.
+ * Carries the `recordId` so the operator can find and approve or delete the
+ * orphan — a bare 500 hid that a record was stranded, and because immutability
+ * rejects re-publishing the same version, a retry would otherwise 409 forever
+ * with no resolvable record (#246 review).
+ */
+export class RegistryPublishIncompleteError extends Error {
+  constructor(
+    readonly recordId: string,
+    message: string,
+    override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'RegistryPublishIncompleteError';
+  }
+}
+
+// --- Port input types ----------------------------------------------------------
+
+export interface PublishInput {
+  readonly kind: string;
+  readonly namespace: string;
+  readonly name: string;
+  readonly version: string;
+  readonly discovery: Readonly<Record<string, unknown>>;
+  readonly runtime: RuntimePayload;
+  /** Authenticated publisher (Cognito sub) — stamped immutably on the record for
+   *  audit. Optional only so non-HTTP callers/tests can omit it. */
+  readonly publisher?: string;
+  /** Force CUSTOM storage (verbatim) instead of a native descriptor. */
+  readonly custom?: boolean;
+  /** Dev convenience: drive create → submit → approve so the record resolves. */
+  readonly autoApprove?: boolean;
+}
+
+export interface ListFilter {
+  readonly kind?: string;
+  readonly namespace?: string;
+}

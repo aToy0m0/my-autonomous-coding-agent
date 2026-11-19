@@ -1,0 +1,1823 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+// --- Mocks ---
+const mockDdbSend = jest.fn();
+jest.mock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn(() => ({})) }));
+jest.mock('@aws-sdk/lib-dynamodb', () => ({
+  DynamoDBDocumentClient: { from: jest.fn(() => ({ send: mockDdbSend })) },
+  GetCommand: jest.fn((input: unknown) => ({ _type: 'Get', input })),
+  PutCommand: jest.fn((input: unknown) => ({ _type: 'Put', input })),
+  UpdateCommand: jest.fn((input: unknown) => ({ _type: 'Update', input })),
+}));
+
+const mockAgentCoreSend = jest.fn();
+jest.mock('@aws-sdk/client-bedrock-agentcore', () => ({
+  BedrockAgentCoreClient: jest.fn(() => ({ send: mockAgentCoreSend })),
+  InvokeAgentRuntimeCommand: jest.fn((input: unknown) => ({ _type: 'InvokeAgentRuntime', input })),
+  StopRuntimeSessionCommand: jest.fn((input: unknown) => ({ _type: 'StopRuntimeSession', input })),
+}));
+
+const mockHydrateContext = jest.fn();
+jest.mock('../../src/handlers/shared/context-hydration', () => ({
+  hydrateContext: mockHydrateContext,
+}));
+
+const mockWriteMinimalEpisode = jest.fn();
+jest.mock('../../src/handlers/shared/memory', () => ({
+  writeMinimalEpisode: mockWriteMinimalEpisode,
+}));
+
+const mockComputePromptVersion = jest.fn().mockReturnValue('abc123def456');
+jest.mock('../../src/handlers/shared/prompt-version', () => ({
+  computePromptVersion: mockComputePromptVersion,
+}));
+
+const mockLoadRepoConfig = jest.fn();
+jest.mock('../../src/handlers/shared/repo-config', () => ({
+  loadRepoConfig: mockLoadRepoConfig,
+  checkRepoOnboarded: jest.fn(),
+}));
+
+// Registry client (#246): the orchestrator resolves Blueprint registry:// refs
+// through this factory. Mock it so hydrateAndTransition tests can drive the
+// resolve → stamp → payload path without the AgentCore SDK.
+const mockRegistryResolve = jest.fn();
+jest.mock('../../src/handlers/shared/registry/factory', () => ({
+  makeRegistryClient: jest.fn(() => ({ resolve: mockRegistryResolve })),
+}));
+
+let ulidCounter = 0;
+jest.mock('ulid', () => ({ ulid: jest.fn(() => `ULID${ulidCounter++}`) }));
+
+// Set env vars before importing (module-level constants are captured at import time)
+process.env.TASK_TABLE_NAME = 'Tasks';
+process.env.TASK_EVENTS_TABLE_NAME = 'TaskEvents';
+process.env.USER_CONCURRENCY_TABLE_NAME = 'UserConcurrency';
+process.env.RUNTIME_ARN = 'arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test';
+process.env.MAX_CONCURRENT_TASKS_PER_USER = '3';
+process.env.TASK_RETENTION_DAYS = '90';
+process.env.MEMORY_ID = 'mem-test-default';
+
+import { classifyError } from '../../src/handlers/shared/error-classifier';
+import {
+  admissionControl,
+  emitTaskEvent,
+  envelopeFor,
+  failTask,
+  finalizeTask,
+  hydrateAndTransition,
+  ISSUE_TITLE_MAX_LENGTH,
+  loadBlueprintConfig,
+  loadTask,
+  pollTaskStatus,
+  queueTask,
+  transitionTask,
+} from '../../src/handlers/shared/orchestrator';
+import { RegistryResolutionError } from '../../src/handlers/shared/registry/types';
+
+const baseTask = {
+  task_id: 'TASK001',
+  user_id: 'user-123',
+  status: 'SUBMITTED',
+  repo: 'org/repo',
+  branch_name: 'bgagent/TASK001/fix-bug',
+  channel_source: 'api',
+  status_created_at: 'SUBMITTED#2024-01-01T00:00:00Z',
+  created_at: '2024-01-01T00:00:00Z',
+  updated_at: '2024-01-01T00:00:00Z',
+  task_description: 'Fix the bug',
+};
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  ulidCounter = 0;
+  mockLoadRepoConfig.mockResolvedValue(null);
+});
+
+describe('loadTask', () => {
+  test('returns task record when found', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: baseTask });
+    const result = await loadTask('TASK001');
+    expect(result.task_id).toBe('TASK001');
+  });
+
+  test('throws when task not found', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: undefined });
+    await expect(loadTask('MISSING')).rejects.toThrow('Task MISSING not found');
+  });
+});
+
+describe('admissionControl', () => {
+  test('returns true when concurrency slot is available', async () => {
+    mockDdbSend.mockResolvedValueOnce({});
+    const result = await admissionControl(baseTask as any);
+    expect(result).toBe(true);
+  });
+
+  test('returns false when concurrency limit reached', async () => {
+    const condErr = new Error('Conditional check failed');
+    condErr.name = 'ConditionalCheckFailedException';
+    mockDdbSend.mockRejectedValueOnce(condErr);
+    const result = await admissionControl(baseTask as any);
+    expect(result).toBe(false);
+  });
+
+  test('throws on unexpected DDB errors', async () => {
+    mockDdbSend.mockRejectedValueOnce(new Error('DynamoDB error'));
+    await expect(admissionControl(baseTask as any)).rejects.toThrow('DynamoDB error');
+  });
+});
+
+describe('hydrateAndTransition', () => {
+  const mockHydratedContext = {
+    version: 1,
+    user_prompt: 'Task ID: TASK001\nRepository: org/repo\n\n## Task\n\nFix the bug',
+    sources: ['task_description'],
+    token_estimate: 20,
+    truncated: false,
+    content_trust: { task_description: 'trusted' },
+  };
+
+  test('transitions to HYDRATING and returns payload with hydrated_context', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload.repo_url).toBe('org/repo');
+    expect(payload.task_id).toBe('TASK001');
+    expect(payload.branch_name).toBe('bgagent/TASK001/fix-bug');
+    expect(payload.prompt).toBe('Fix the bug');
+    expect(payload.hydrated_context).toEqual(mockHydratedContext);
+  });
+
+  test('includes issue_number when present', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce({ ...mockHydratedContext, sources: ['issue', 'task_description'] });
+    const taskWithIssue = { ...baseTask, issue_number: 42 };
+    const payload = await hydrateAndTransition(taskWithIssue as any);
+    expect(payload.issue_number).toBe('42');
+    expect(payload.hydrated_context).toBeDefined();
+  });
+
+  test('includes max_turns in payload when present on task record', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithMaxTurns = { ...baseTask, max_turns: 50 };
+    const payload = await hydrateAndTransition(taskWithMaxTurns as any);
+    expect(payload.max_turns).toBe(50);
+  });
+
+  test('defaults max_turns to 100 when not on task record and no blueprint config', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload.max_turns).toBe(100);
+  });
+
+  test('threads trace: true into the agent payload when set on the task record', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithTrace = { ...baseTask, trace: true };
+    const payload = await hydrateAndTransition(taskWithTrace as any);
+    expect(payload.trace).toBe(true);
+  });
+
+  test('omits trace from payload when task record has no trace flag (slim wire)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload).not.toHaveProperty('trace');
+  });
+
+  test('threads user_id into the agent payload (design §10.1 — required for trace S3 key)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    // user_id is threaded unconditionally (not just when trace=true)
+    // so that a future feature needing it does not have to re-plumb.
+    // The agent only USES it when trace=true.
+    expect(payload.user_id).toBe('user-123');
+  });
+
+  test('threads user_id even when trace flag is absent', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskNoTrace = { ...baseTask, trace: undefined };
+    const payload = await hydrateAndTransition(taskNoTrace as any);
+    expect(payload.user_id).toBe('user-123');
+    expect(payload).not.toHaveProperty('trace');
+  });
+
+  test('payload.user_id is undefined when the task record lacks user_id (defensive)', async () => {
+    // Defends the Stage 3 ↔ Stage 4 contract: a legacy / corrupted
+    // record without ``user_id`` should surface as ``undefined`` in
+    // the payload (which JSON.stringify drops entirely), not get
+    // silently coerced to an empty string that would then combine
+    // with ``trace=true`` to produce an unreachable ``traces//...``
+    // S3 key. Admission-control should catch this upstream; test
+    // pins the downstream behavior regardless.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskNoUser = { ...baseTask };
+    delete (taskNoUser as { user_id?: string }).user_id;
+    const payload = await hydrateAndTransition(taskNoUser as any);
+    expect(payload.user_id).toBeUndefined();
+  });
+
+  test('throws when guardrail_blocked is set on hydrated context', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce({
+      ...mockHydratedContext,
+      guardrail_blocked: 'PR context blocked by content policy',
+    });
+    const prTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' }, pr_number: 10 };
+    await expect(hydrateAndTransition(prTask as any)).rejects.toThrow(
+      'Guardrail blocked: PR context blocked by content policy',
+    );
+
+    // Verify guardrail_blocked event was emitted before the throw
+    const putCalls = mockDdbSend.mock.calls
+      .filter((c: any) => c[0]._type === 'Put')
+      .map((c: any) => c[0].input.Item);
+    const guardrailEvent = putCalls.find((item: any) => item.event_type === 'guardrail_blocked');
+    expect(guardrailEvent).toBeDefined();
+    expect(guardrailEvent.metadata.reason).toBe('PR context blocked by content policy');
+    expect(guardrailEvent.metadata.resolved_workflow).toBe('coding/pr-iteration-v1');
+    expect(guardrailEvent.metadata.pr_number).toBe(10);
+    expect(guardrailEvent.metadata.sources).toEqual(['task_description']);
+    expect(guardrailEvent.metadata.token_estimate).toBe(20);
+    expect(guardrailEvent.metadata.content_trust).toEqual({ task_description: 'trusted' });
+  });
+
+  test('still throws guardrail error when emitTaskEvent fails during guardrail_blocked handling', async () => {
+    let callCount = 0;
+    mockDdbSend.mockImplementation(() => {
+      callCount++;
+      // First two calls succeed (transitionTask SUBMITTED->HYDRATING, emitTaskEvent hydration_started)
+      // Third call is emitTaskEvent('guardrail_blocked') — fail it
+      if (callCount === 3) return Promise.reject(new Error('DDB write failed'));
+      return Promise.resolve({});
+    });
+    mockHydrateContext.mockResolvedValueOnce({
+      ...mockHydratedContext,
+      guardrail_blocked: 'PR context blocked by content policy',
+    });
+    const prTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' }, pr_number: 10 };
+    await expect(hydrateAndTransition(prTask as any)).rejects.toThrow(
+      'Guardrail blocked: PR context blocked by content policy',
+    );
+  });
+
+  test('hydration_complete event includes source metadata', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    await hydrateAndTransition(baseTask as any);
+    // Find the hydration_complete PutCommand (third DDB call: transitionTask, hydration_started, hydration_complete)
+    const putCalls = mockDdbSend.mock.calls.filter(
+      (call: any[]) => call[0]._type === 'Put' && call[0].input.Item.event_type === 'hydration_complete',
+    );
+    expect(putCalls).toHaveLength(1);
+    const metadata = putCalls[0][0].input.Item.metadata;
+    expect(metadata.sources).toEqual(['task_description']);
+    expect(metadata.token_estimate).toBe(20);
+    expect(metadata.truncated).toBe(false);
+    expect(metadata.content_trust).toEqual({ task_description: 'trusted' });
+  });
+
+  test('lifecycle events carry the {user_id, repo} correlation envelope (#245)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    await hydrateAndTransition(baseTask as any);
+    const events = mockDdbSend.mock.calls
+      .filter((c: any) => c[0]._type === 'Put')
+      .map((c: any) => c[0].input.Item);
+    for (const eventType of ['hydration_started', 'hydration_complete']) {
+      const evt = events.find((e: any) => e.event_type === eventType);
+      expect(evt).toMatchObject({ user_id: 'user-123', repo: 'org/repo' });
+    }
+  });
+
+  test('repo-less task omits repo but still stamps user_id (#245, #248)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const { repo: _repo, ...repoLess } = baseTask;
+    await hydrateAndTransition(repoLess as any);
+    const started = mockDdbSend.mock.calls
+      .filter((c: any) => c[0]._type === 'Put')
+      .map((c: any) => c[0].input.Item)
+      .find((e: any) => e.event_type === 'hydration_started');
+    expect(started.user_id).toBe('user-123');
+    expect(started).not.toHaveProperty('repo');
+  });
+});
+
+describe('emitTaskEvent — correlation envelope (#245)', () => {
+  test('stamps user_id and repo as top-level fields when supplied', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await emitTaskEvent('TASK001', 'session_started', { session_id: 's-1' }, { user_id: 'user-123', repo: 'org/repo' });
+    const item = mockDdbSend.mock.calls.find((c: any) => c[0]._type === 'Put')[0].input.Item;
+    expect(item).toMatchObject({
+      task_id: 'TASK001',
+      event_type: 'session_started',
+      user_id: 'user-123',
+      repo: 'org/repo',
+    });
+    expect(item.metadata).toEqual({ session_id: 's-1' });
+  });
+
+  test('omits repo (not null/empty) when repo-less, keeps user_id', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await emitTaskEvent('TASK001', 'task_failed', undefined, { user_id: 'user-123', repo: undefined });
+    const item = mockDdbSend.mock.calls.find((c: any) => c[0]._type === 'Put')[0].input.Item;
+    expect(item.user_id).toBe('user-123');
+    expect(item).not.toHaveProperty('repo');
+  });
+
+  test('omits both when no correlation is supplied (back-compat)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await emitTaskEvent('TASK001', 'task_created');
+    const item = mockDdbSend.mock.calls.find((c: any) => c[0]._type === 'Put')[0].input.Item;
+    expect(item).not.toHaveProperty('user_id');
+    expect(item).not.toHaveProperty('repo');
+  });
+});
+
+describe('envelopeFor — single source for log context + event correlation (#245)', () => {
+  function captureLine(fn: () => void): Record<string, unknown> {
+    const lines: string[] = [];
+    const spy = jest.spyOn(process.stdout, 'write').mockImplementation((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try { fn(); } finally { spy.mockRestore(); }
+    return JSON.parse(lines[0]) as Record<string, unknown>;
+  }
+
+  test('log child and correlation both carry user_id + repo', () => {
+    const { log, correlation } = envelopeFor({ task_id: 't-1', user_id: 'u-1', repo: 'o/r' });
+    // Regression guard for the loadBlueprintConfig gap: the log child must carry
+    // user_id, not just task_id/repo — every admission→terminal line needs it.
+    expect(captureLine(() => log.info('x'))).toMatchObject({ task_id: 't-1', user_id: 'u-1', repo: 'o/r' });
+    expect(correlation).toEqual({ user_id: 'u-1', repo: 'o/r' });
+  });
+
+  test('repo-less: repo omitted from the log line and left undefined on correlation', () => {
+    const { log, correlation } = envelopeFor({ task_id: 't-1', user_id: 'u-1' });
+    const line = captureLine(() => log.info('x'));
+    expect(line).toMatchObject({ task_id: 't-1', user_id: 'u-1' });
+    expect(line).not.toHaveProperty('repo');
+    expect(correlation.repo).toBeUndefined();
+  });
+});
+
+describe('hydrateAndTransition — Cedar HITL payload threading', () => {
+  const mockHydratedContext = {
+    version: 1,
+    user_prompt: 'Task ID: TASK001\nRepository: org/repo\n\n## Task\n\nFix the bug',
+    sources: ['task_description'],
+    token_estimate: 20,
+    truncated: false,
+    content_trust: { task_description: 'trusted' },
+  };
+
+  test('threads approval_timeout_s when present on task record', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithTimeout = { ...baseTask, approval_timeout_s: 600 };
+    const payload = await hydrateAndTransition(taskWithTimeout as any);
+    expect(payload.approval_timeout_s).toBe(600);
+  });
+
+  test('omits approval_timeout_s when undefined (keeps wire slim)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload).not.toHaveProperty('approval_timeout_s');
+  });
+
+  test('threads initial_approvals when non-empty', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithApprovals = {
+      ...baseTask,
+      initial_approvals: ['tool_type:Read', 'rule:force_push_any'],
+    };
+    const payload = await hydrateAndTransition(taskWithApprovals as any);
+    expect(payload.initial_approvals).toEqual(['tool_type:Read', 'rule:force_push_any']);
+  });
+
+  test('omits initial_approvals when empty list (avoid no-op list on the wire)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithEmpty = { ...baseTask, initial_approvals: [] };
+    const payload = await hydrateAndTransition(taskWithEmpty as any);
+    expect(payload).not.toHaveProperty('initial_approvals');
+  });
+
+  test('Chunk 7 §13.6: threads initial_approval_gate_count when approval_gate_count > 0', async () => {
+    // Container-restart scenario: TaskTable has a non-zero counter
+    // from a prior container. Orchestrator must seed the agent's
+    // PolicyEngine so the cap stays enforced across restarts.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskRestart = { ...baseTask, approval_gate_count: 17 };
+    const payload = await hydrateAndTransition(taskRestart as any);
+    expect(payload.initial_approval_gate_count).toBe(17);
+  });
+
+  test('Chunk 7: omits initial_approval_gate_count when approval_gate_count is zero (fresh task)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const freshTask = { ...baseTask, approval_gate_count: 0 };
+    const payload = await hydrateAndTransition(freshTask as any);
+    // Fresh task — no need to thread 0; the agent's default of 0
+    // preserves the existing path without an explicit field on the
+    // wire payload.
+    expect(payload).not.toHaveProperty('initial_approval_gate_count');
+  });
+
+  test('Chunk 7: omits initial_approval_gate_count when approval_gate_count undefined (legacy task)', async () => {
+    // Legacy task records predating the Chunk 1 TaskRecord change
+    // don't have the attribute at all.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload).not.toHaveProperty('initial_approval_gate_count');
+  });
+
+  test('Chunk 7: ignores non-numeric approval_gate_count defensively', async () => {
+    // DynamoDB schema enforces N for this attribute, but a corrupted
+    // record (e.g. manual edit) should NOT explode the orchestrator.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const corruptTask = { ...baseTask, approval_gate_count: 'not-a-number' };
+    const payload = await hydrateAndTransition(corruptTask as any);
+    expect(payload).not.toHaveProperty('initial_approval_gate_count');
+  });
+
+  test('Chunk 7b §4 step 5: threads approval_gate_cap into payload when present', async () => {
+    // TaskRecord carries the cap that was resolved and persisted at
+    // submit-time. The orchestrator must forward it unconditionally
+    // (unlike the counter, which only threads when non-zero) so the
+    // agent adopts the blueprint-configured cap rather than its
+    // compile-time fallback.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithCap = { ...baseTask, approval_gate_cap: 200 };
+    const payload = await hydrateAndTransition(taskWithCap as any);
+    expect(payload.approval_gate_cap).toBe(200);
+  });
+
+  test('Chunk 7b: threads default-50 cap into payload', async () => {
+    // Fresh task from Chunk 7b deploys carries approval_gate_cap=50
+    // (the platform default frozen at submit-time). Must be threaded
+    // even though 50 happens to equal the agent's compile-time
+    // DEFAULT_APPROVAL_GATE_CAP — the semantic distinction is that
+    // "50 from TaskRecord" means "submit-time decision" and behaves
+    // correctly under mid-task blueprint edits.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithDefault = { ...baseTask, approval_gate_cap: 50 };
+    const payload = await hydrateAndTransition(taskWithDefault as any);
+    expect(payload.approval_gate_cap).toBe(50);
+  });
+
+  test('Chunk 7b: omits approval_gate_cap when task record predates Chunk 7b', async () => {
+    // Legacy tasks submitted before Chunk 7b landed don't have the
+    // attribute. Orchestrator must omit it so the agent falls back to
+    // its own DEFAULT_APPROVAL_GATE_CAP and behavior matches the
+    // pre-Chunk-7b deploy.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload).not.toHaveProperty('approval_gate_cap');
+  });
+
+  test('Chunk 7b: ignores non-numeric approval_gate_cap defensively', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const corruptTask = { ...baseTask, approval_gate_cap: 'not-a-number' };
+    const payload = await hydrateAndTransition(corruptTask as any);
+    expect(payload).not.toHaveProperty('approval_gate_cap');
+  });
+
+  test.each([
+    ['NaN', NaN],
+    ['negative', -1],
+    ['zero', 0],
+    ['above max', 501],
+    ['non-integer', 3.14],
+    ['Infinity', Infinity],
+  ])('Chunk 7b: rejects corrupted approval_gate_cap value (%s) and omits from payload', async (_label, badValue) => {
+    // Submit-path bounds-checks the blueprint value before persisting,
+    // so these branches only fire on schema drift / hand-edited rows.
+    // Omitting keeps the container starting (agent falls back to
+    // engine default-50) instead of crashing PolicyEngine.__init__.
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const corruptTask = { ...baseTask, approval_gate_cap: badValue };
+    const payload = await hydrateAndTransition(corruptTask as any);
+    expect(payload).not.toHaveProperty('approval_gate_cap');
+  });
+
+  test.each([
+    ['min (1)', 1],
+    ['max (500)', 500],
+  ])('Chunk 7b: accepts boundary approval_gate_cap %s', async (_label, goodValue) => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const task = { ...baseTask, approval_gate_cap: goodValue };
+    const payload = await hydrateAndTransition(task as any);
+    expect(payload.approval_gate_cap).toBe(goodValue);
+  });
+});
+
+describe('pollTaskStatus', () => {
+  test.each(['agentcore', 'lambda-microvm'] as const)(
+    '%s stays healthy immediately after a long approval wait resumes',
+    async (computeType) => {
+      const beforeApproval = new Date(Date.now() - 600_000).toISOString();
+      mockDdbSend.mockResolvedValueOnce({
+        Item: {
+          status: 'AWAITING_APPROVAL',
+          session_id: 'sess-1',
+          started_at: beforeApproval,
+          agent_heartbeat_at: beforeApproval,
+        },
+      });
+      const waiting = await pollTaskStatus('TASK001', { attempts: 5 }, computeType);
+      expect(waiting.sessionUnhealthy).toBe(false);
+
+      // The agent's conditional resume transaction refreshes this timestamp with
+      // status RUNNING. Poll before the independent 45-second worker ticks.
+      mockDdbSend.mockResolvedValueOnce({
+        Item: {
+          status: 'RUNNING',
+          session_id: 'sess-1',
+          started_at: beforeApproval,
+          agent_heartbeat_at: new Date().toISOString(),
+        },
+      });
+      const resumed = await pollTaskStatus('TASK001', waiting, computeType);
+      expect(resumed.lastStatus).toBe('RUNNING');
+      expect(resumed.sessionUnhealthy).toBe(false);
+    },
+  );
+
+  test('increments attempt count and reads status', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { status: 'RUNNING' } });
+    const result = await pollTaskStatus('TASK001', { attempts: 5 }, 'agentcore');
+    expect(result.attempts).toBe(6);
+    expect(result.lastStatus).toBe('RUNNING');
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+
+  test('handles missing item gracefully', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: undefined });
+    const result = await pollTaskStatus('TASK001', { attempts: 0 }, 'agentcore');
+    expect(result.attempts).toBe(1);
+    expect(result.lastStatus).toBeUndefined();
+  });
+
+  // The gate `finalizeTask`'s defensive FINALIZING arm depends on. That arm is
+  // currently unreachable BECAUSE of this predicate, and its comment says so — so
+  // this test is what keeps the comment true. If `pollTaskStatus` ever widens the
+  // status gate, the arm becomes live and this test is the place that says the
+  // reachability changed.
+  test.each([
+    'FINALIZING',
+    'AWAITING_APPROVAL',
+    'HYDRATING',
+    'QUEUED',
+  ])('never sets sessionUnhealthy for a %s task — the flag is RUNNING-scoped', async (status) => {
+    const longAgo = new Date(Date.now() - 3_600_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status,
+        session_id: 'sess-1',
+        started_at: longAgo,
+        // Stale by any measure: an hour old against a 45 s cadence.
+        agent_heartbeat_at: longAgo,
+      },
+    });
+
+    const result = await pollTaskStatus('TASK001', { attempts: 5 }, 'lambda-microvm');
+
+    expect(result.lastStatus).toBe(status);
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+
+  test('DOES set it for RUNNING with the same stale inputs (proves the above is not vacuous)', async () => {
+    const longAgo = new Date(Date.now() - 3_600_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: 'sess-1',
+        started_at: longAgo,
+        agent_heartbeat_at: longAgo,
+      },
+    });
+
+    const result = await pollTaskStatus('TASK001', { attempts: 5 }, 'lambda-microvm');
+
+    expect(result.sessionUnhealthy).toBe(true);
+  });
+
+  test('rejects an unknown compute type instead of silently skipping heartbeat liveness', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { status: 'RUNNING' } });
+
+    await expect(pollTaskStatus('TASK001', { attempts: 0 }, 'unknown' as never)).rejects.toThrow(
+      'Unknown compute type for heartbeat liveness: unknown',
+    );
+  });
+
+  test('sets sessionUnhealthy when agent heartbeat is stale (RUNNING)', async () => {
+    const old = new Date(Date.now() - 400_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: old,
+        agent_heartbeat_at: old,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+    expect(result.sessionUnhealthy).toBe(true);
+  });
+
+  test('does not set sessionUnhealthy when heartbeat is fresh', async () => {
+    const started = new Date(Date.now() - 200_000).toISOString();
+    const hb = new Date(Date.now() - 30_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: started,
+        agent_heartbeat_at: hb,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+
+  test('does not set sessionUnhealthy when agent_heartbeat_at is absent but within grace period', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: new Date(Date.now() - 60_000).toISOString(),
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+
+  test('sets sessionUnhealthy when agent_heartbeat_at is absent and past grace + stale window', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: new Date(Date.now() - 400_000).toISOString(),
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+    expect(result.sessionUnhealthy).toBe(true);
+  });
+
+  test('does not set sessionUnhealthy for ECS when agent_heartbeat_at is absent and old', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: new Date(Date.now() - 400_000).toISOString(),
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'ecs');
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+
+  test('does not set sessionUnhealthy for ECS even when agent_heartbeat_at is present and stale', async () => {
+    const old = new Date(Date.now() - 400_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: old,
+        agent_heartbeat_at: old,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'ecs');
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+
+  test('keeps AgentCore stale-heartbeat behavior when compute type is agentcore', async () => {
+    const old = new Date(Date.now() - 400_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: '550e8400-e29b-41d4-a716-446655440000',
+        started_at: old,
+        agent_heartbeat_at: old,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+    expect(result.sessionUnhealthy).toBe(true);
+  });
+
+  // --- ADR-021 P2: heartbeat liveness on lambda-microvm ---
+  //
+  // The gap this closes: the agent writes `agent_heartbeat_at` on every substrate,
+  // but the orchestrator only ACTED on it for agentcore. On a MicroVM the
+  // substrate `GetMicrovm` cross-check catches a VM that DIED and nothing else —
+  // an alive, healthy VM whose in-guest pipeline is hung or was OOM-killed inside
+  // the guest looks perfectly fine (nothing self-terminates on this substrate, and
+  // it stays RUNNING with no stateReason). That task would burn the full ~8.5 h
+  // poll window while billing an 8-hour reservation. So liveness here is substrate
+  // state AND agent heartbeat.
+
+  test('sets sessionUnhealthy for lambda-microvm when the heartbeat is stale', async () => {
+    const old = new Date(Date.now() - 400_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: 'mvm-0123456789abcdef',
+        started_at: old,
+        agent_heartbeat_at: old,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'lambda-microvm');
+    expect(result.sessionUnhealthy).toBe(true);
+  });
+
+  test('sets sessionUnhealthy for lambda-microvm when the agent never heartbeat past the window', async () => {
+    // The in-guest early-crash case: the /run hook returned 200, the pipeline died
+    // before its first heartbeat, and the MicroVM is still happily RUNNING.
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: 'mvm-0123456789abcdef',
+        started_at: new Date(Date.now() - 400_000).toISOString(),
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'lambda-microvm');
+    expect(result.sessionUnhealthy).toBe(true);
+  });
+
+  test('lambda-microvm uses the SAME thresholds as agentcore — a fresh heartbeat is healthy', async () => {
+    // Shared thresholds on purpose: the timestamp is written by the same pipeline
+    // code at the same cadence regardless of substrate, so a backend-specific grace
+    // window would encode a difference that does not exist.
+    const started = new Date(Date.now() - 200_000).toISOString();
+    const heartbeat = new Date(Date.now() - 30_000).toISOString();
+    const item = {
+      status: 'RUNNING',
+      session_id: 'mvm-0123456789abcdef',
+      started_at: started,
+      agent_heartbeat_at: heartbeat,
+    };
+
+    mockDdbSend.mockResolvedValueOnce({ Item: item });
+    const microvm = await pollTaskStatus('TASK001', { attempts: 1 }, 'lambda-microvm');
+    mockDdbSend.mockResolvedValueOnce({ Item: item });
+    const agentcore = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+
+    expect(microvm.sessionUnhealthy).toBe(false);
+    expect(microvm.sessionUnhealthy).toBe(agentcore.sessionUnhealthy);
+  });
+
+  test('lambda-microvm within the grace period is healthy, exactly as agentcore is', async () => {
+    const item = {
+      status: 'RUNNING',
+      session_id: 'mvm-0123456789abcdef',
+      started_at: new Date(Date.now() - 60_000).toISOString(),
+    };
+    mockDdbSend.mockResolvedValueOnce({ Item: item });
+    const microvm = await pollTaskStatus('TASK001', { attempts: 1 }, 'lambda-microvm');
+    mockDdbSend.mockResolvedValueOnce({ Item: item });
+    const agentcore = await pollTaskStatus('TASK001', { attempts: 1 }, 'agentcore');
+
+    expect(microvm.sessionUnhealthy).toBe(false);
+    expect(agentcore.sessionUnhealthy).toBe(false);
+  });
+
+  test('a stale heartbeat on a NON-RUNNING lambda-microvm task is not unhealthy', async () => {
+    // AWAITING_APPROVAL is the case that matters: from P3 the orchestrator SUSPENDS
+    // the MicroVM during an approval wait, which stops the in-guest pipeline (and
+    // its heartbeats) by design. Failing that task would be the worst possible
+    // regression — the check is scoped to RUNNING for exactly this reason.
+    const old = new Date(Date.now() - 400_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'AWAITING_APPROVAL',
+        session_id: 'mvm-0123456789abcdef',
+        started_at: old,
+        agent_heartbeat_at: old,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'lambda-microvm');
+    expect(result.sessionUnhealthy).toBe(false);
+    expect(result.lastStatus).toBe('AWAITING_APPROVAL');
+  });
+
+  test('ECS remains untouched by the widening', async () => {
+    // The one backend deliberately left out: DescribeTasks reports a real container
+    // exit (including OOM-kill / exit 137) with an exit code, and the ECS poll block
+    // interprets it with its own patience counters. Layering the heartbeat on top
+    // would give one backend two independently-tuned kill paths for one failure.
+    const old = new Date(Date.now() - 400_000).toISOString();
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        status: 'RUNNING',
+        session_id: 'arn:aws:ecs:us-east-1:123456789012:task/agent/abc',
+        started_at: old,
+        agent_heartbeat_at: old,
+      },
+    });
+    const result = await pollTaskStatus('TASK001', { attempts: 1 }, 'ecs');
+    expect(result.sessionUnhealthy).toBe(false);
+  });
+});
+
+describe('loadBlueprintConfig', () => {
+  test('returns platform defaults when no repo config exists', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(null);
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.compute_type).toBe('agentcore');
+    expect(config.runtime_arn).toBe('arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test');
+  });
+
+  test('merges per-repo config with platform defaults', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      runtime_arn: 'arn:aws:bedrock-agentcore:us-east-1:123:runtime/custom',
+      model_id: 'anthropic.claude-sonnet-4-6',
+      max_turns: 50,
+      poll_interval_ms: 15000,
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.runtime_arn).toBe('arn:aws:bedrock-agentcore:us-east-1:123:runtime/custom');
+    expect(config.model_id).toBe('anthropic.claude-sonnet-4-6');
+    expect(config.max_turns).toBe(50);
+    expect(config.poll_interval_ms).toBe(15000);
+  });
+
+  test('uses per-repo github_token_secret_arn when available', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      github_token_secret_arn: 'arn:aws:secretsmanager:us-east-1:123:secret:per-repo-token',
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.github_token_secret_arn).toBe('arn:aws:secretsmanager:us-east-1:123:secret:per-repo-token');
+  });
+
+  test('clamps poll_interval_ms below minimum to 5000', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      poll_interval_ms: 1000,
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.poll_interval_ms).toBe(5000);
+  });
+
+  test('clamps poll_interval_ms above maximum to 300000', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      poll_interval_ms: 600000,
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.poll_interval_ms).toBe(300000);
+  });
+
+  test('leaves poll_interval_ms unchanged when within range', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      poll_interval_ms: 30000,
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.poll_interval_ms).toBe(30000);
+  });
+
+  test('returns undefined poll_interval_ms when repo config has none', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.poll_interval_ms).toBeUndefined();
+  });
+
+  test('passes cedar_policies from repo config', async () => {
+    const policies = ['forbid (principal, action, resource) when { resource == Agent::Tool::"Bash" };'];
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      cedar_policies: policies,
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.cedar_policies).toEqual(policies);
+  });
+
+  test('returns undefined cedar_policies when repo config has none', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.cedar_policies).toBeUndefined();
+  });
+
+  // Compute substrate is a per-repo property that applies to ALL workflows: a
+  // read-only review task clones + reads the SAME repo, so it needs the
+  // SAME compute (a repo big enough to need the 64GB ECS tier to build also OOMs
+  // the AgentCore microVM just reading it). So an ecs repo's ecs compute_type
+  // flows through regardless of the workflow's read-only-ness.
+  const ecsRepoConfig = {
+    repo: 'org/repo',
+    status: 'active' as const,
+    onboarded_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+    compute_type: 'ecs' as const,
+  };
+
+  test('a read-only workflow (coding/pr-review-v1) on an ecs repo INHERITS ecs (same repo, same footprint)', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(ecsRepoConfig);
+    const planTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-review-v1', version: '1.0.0' } };
+    const config = await loadBlueprintConfig(planTask as any);
+    expect(config.compute_type).toBe('ecs');
+  });
+
+  test('a writeable workflow (coding/new-task-v1) on an ecs repo also uses ecs', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(ecsRepoConfig);
+    const buildTask = { ...baseTask, resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' } };
+    const config = await loadBlueprintConfig(buildTask as any);
+    expect(config.compute_type).toBe('ecs');
+  });
+});
+
+describe('hydrateAndTransition with blueprint config', () => {
+  const mockHydratedContext = {
+    version: 1,
+    user_prompt: 'Task ID: TASK001\nRepository: org/repo\n\n## Task\n\nFix the bug',
+    sources: ['task_description'],
+    token_estimate: 20,
+    truncated: false,
+    content_trust: { task_description: 'trusted' },
+  };
+
+  test('includes system_prompt_overrides in payload when blueprint config has them', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      system_prompt_overrides: 'Always use TypeScript.',
+    });
+    expect(payload.system_prompt_overrides).toBe('Always use TypeScript.');
+  });
+
+  test('includes model_id in payload when blueprint config has it', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      model_id: 'anthropic.claude-sonnet-4-6',
+    });
+    expect(payload.model_id).toBe('anthropic.claude-sonnet-4-6');
+  });
+
+  test('omits model_id from payload when blueprint config does not have it', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+    });
+    expect(payload.model_id).toBeUndefined();
+  });
+
+  test('uses blueprint max_turns when task record has none', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      max_turns: 75,
+    });
+    expect(payload.max_turns).toBe(75);
+  });
+
+  test('task-level max_turns overrides blueprint max_turns', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const taskWithMaxTurns = { ...baseTask, max_turns: 25 };
+    const payload = await hydrateAndTransition(taskWithMaxTurns as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      max_turns: 75,
+    });
+    expect(payload.max_turns).toBe(25);
+  });
+
+  test('passes githubTokenSecretArn option to hydrateContext', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      github_token_secret_arn: 'arn:aws:secretsmanager:us-east-1:123:secret:per-repo-token',
+    });
+    expect(mockHydrateContext).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ githubTokenSecretArn: 'arn:aws:secretsmanager:us-east-1:123:secret:per-repo-token' }),
+    );
+  });
+
+  test('includes cedar_policies in payload when blueprint config has them', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const policies = ['forbid (principal, action, resource) when { resource == Agent::Tool::"Bash" };'];
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      cedar_policies: policies,
+    });
+    expect(payload.cedar_policies).toEqual(policies);
+  });
+
+  test('omits cedar_policies from payload when blueprint config has none', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+    });
+    expect(payload.cedar_policies).toBeUndefined();
+  });
+
+  test('omits cedar_policies from payload when array is empty', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      cedar_policies: [],
+    });
+    expect(payload.cedar_policies).toBeUndefined();
+  });
+});
+
+describe('hydrateAndTransition — registry asset resolution (#246)', () => {
+  const mockHydratedContext = {
+    version: 1,
+    user_prompt: 'Task ID: TASK001\nRepository: org/repo\n\n## Task\n\nFix the bug',
+    sources: ['task_description'],
+    token_estimate: 20,
+    truncated: false,
+    content_trust: { task_description: 'trusted' },
+  };
+
+  const resolvedAsset = (over: Record<string, unknown>) => ({
+    kind: 'mcp_server',
+    namespace: 'acme',
+    name: 'pdf-tools',
+    version: '1.0.0',
+    runtime: { transport: 'http', url: 'https://x' },
+    warnings: [],
+    ...over,
+  });
+
+  test('stamps resolved_assets on the TaskRecord and threads the bundle into the payload', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    mockRegistryResolve.mockResolvedValueOnce(resolvedAsset({}));
+
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      mcp_servers: ['registry://mcp_server/acme/pdf-tools@^1.0.0'],
+    });
+
+    // Threaded into the agent payload.
+    expect(payload.resolved_assets).toEqual([
+      expect.objectContaining({ kind: 'mcp_server', namespace: 'acme', name: 'pdf-tools', version: '1.0.0' }),
+    ]);
+    // Stamped on the TaskRecord via an UpdateCommand carrying resolved_assets.
+    const stamp = mockDdbSend.mock.calls
+      .map((c) => c[0])
+      .find((cmd: any) => cmd._type === 'Update' && cmd.input?.ExpressionAttributeNames?.['#ra'] === 'resolved_assets');
+    expect(stamp).toBeDefined();
+    expect(stamp.input.ExpressionAttributeValues[':ra']).toEqual([
+      { kind: 'mcp_server', id: 'acme/pdf-tools', version: '1.0.0' },
+    ]);
+  });
+
+  test('emits a registry_asset_warning TaskEvent for a DEPRECATED asset', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    mockRegistryResolve.mockResolvedValueOnce(resolvedAsset({ warnings: ['DEPRECATED'] }));
+
+    await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      mcp_servers: ['registry://mcp_server/acme/pdf-tools@^1.0.0'],
+    });
+
+    // A TaskEvent Put (event_type registry_asset_warning) was written.
+    const warnPut = mockDdbSend.mock.calls
+      .map((c) => c[0])
+      .find((cmd: any) => cmd._type === 'Put' && JSON.stringify(cmd.input?.Item ?? {}).includes('registry_asset_warning'));
+    expect(warnPut).toBeDefined();
+    // The stamped audit triple keeps the warning too.
+    const stamp = mockDdbSend.mock.calls
+      .map((c) => c[0])
+      .find((cmd: any) => cmd._type === 'Update' && cmd.input?.ExpressionAttributeNames?.['#ra'] === 'resolved_assets');
+    expect(stamp.input.ExpressionAttributeValues[':ra'][0].warnings).toEqual(['DEPRECATED']);
+  });
+
+  test('merges resolved cedar_policy_module text after inline blueprint policies', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    mockRegistryResolve.mockResolvedValueOnce(resolvedAsset({
+      kind: 'cedar_policy_module',
+      name: 'guard',
+      runtime: { cedar_text: 'forbid (principal, action, resource);' },
+    }));
+
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      cedar_policies: ['permit (principal, action, resource);'],
+      cedar_policy_modules: ['registry://cedar_policy_module/acme/guard@^1.0.0'],
+    });
+
+    expect(payload.cedar_policies).toEqual([
+      'permit (principal, action, resource);',
+      'forbid (principal, action, resource);',
+    ]);
+  });
+
+  test('fails closed when a pinned cedar_policy_module resolves to empty cedar_text', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    mockRegistryResolve.mockResolvedValueOnce(resolvedAsset({
+      kind: 'cedar_policy_module',
+      name: 'guard',
+      runtime: { cedar_text: '   ' },
+    }));
+
+    await expect(hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      cedar_policy_modules: ['registry://cedar_policy_module/acme/guard@^1.0.0'],
+    })).rejects.toThrow(/empty cedar_text/);
+  });
+
+  test('fails closed (propagates) when a registry ref cannot be resolved', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    mockRegistryResolve.mockRejectedValueOnce(new RegistryResolutionError('NO_MATCHING_VERSION', 'r', 'none'));
+
+    await expect(hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:test',
+      mcp_servers: ['registry://mcp_server/acme/pdf-tools@^9.0.0'],
+    })).rejects.toBeInstanceOf(RegistryResolutionError);
+  });
+});
+
+describe('finalizeTask', () => {
+  const supervisor = {
+    version: 1 as const,
+    microvmId: 'vm',
+    firstObservedAtMs: 1,
+    sessionDeadlineMs: 28_800_001,
+    lifetimeVerified: true,
+    consecutivePollFailures: 3,
+    consecutiveResumeFailures: 0,
+    anomalyReported: false,
+    nextPollInMs: 5_000,
+  };
+  const vmTask = () => ({
+    ...baseTask,
+    status: 'AWAITING_APPROVAL',
+    compute_type: 'lambda-microvm',
+    session_id: 'vm',
+    compute_metadata: { microvmId: 'vm', endpoint: 'https://vm.example' },
+  });
+
+  const concurrencyDecrements = () => mockDdbSend.mock.calls.filter(([command]) =>
+    String(command.input?.UpdateExpression ?? '').includes('active_count = active_count - :one'));
+
+  test.each(['AWAITING_APPROVAL', 'RUNNING', 'HYDRATING'])('supervisor failure strongly reads %s and conditionally fails only its worker', async status => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...vmTask(), status } }).mockResolvedValue({});
+    await finalizeTask('TASK001', {
+      attempts: 3, microvmSupervisor: supervisor, microvmFailureReason: 'substrate-read-failed',
+    }, 'user-123');
+    const read = mockDdbSend.mock.calls[0][0];
+    expect(read.input.ConsistentRead).toBe(true);
+    const write = mockDdbSend.mock.calls[1][0];
+    expect(write.input.ConditionExpression).toContain('compute_metadata.microvmId = :microvmId');
+    expect(write.input.ExpressionAttributeValues).toMatchObject({
+      ':fromStatus': status,
+      ':toStatus': 'FAILED',
+      ':microvmId': 'vm',
+      ':attr_error_message': 'MicroVM supervisor: substrate-read-failed',
+    });
+    expect(concurrencyDecrements()).toHaveLength(1);
+  });
+
+  test('supervisor finalization preserves a committed cancellation', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...vmTask(), status: 'CANCELLED', memory_written: true } })
+      .mockResolvedValue({});
+    await finalizeTask('TASK001', {
+      attempts: 3, microvmSupervisor: supervisor, microvmFailureReason: 'resume-request-failed-repeatedly',
+    }, 'user-123');
+    expect(mockDdbSend.mock.calls.some(([command]) => command.input.ExpressionAttributeValues?.[':toStatus'])).toBe(false);
+    expect(mockDdbSend.mock.calls.find(([command]) => command._type === 'Put')?.[0].input.Item.event_type).toBe('task_cancelled');
+  });
+
+  test('changed worker ownership skips both task mutation and reservation release', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...vmTask(), session_id: 'replacement' } });
+    await expect(finalizeTask('TASK001', {
+      attempts: 3, microvmSupervisor: supervisor, microvmFailureReason: 'substrate-read-failed',
+    }, 'user-123')).resolves.toBe(false);
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+    expect(concurrencyDecrements()).toHaveLength(0);
+  });
+
+  test.each([['RUNNING', 'TIMED_OUT'], ['AWAITING_APPROVAL', 'FAILED'], ['HYDRATING', 'FAILED']])(
+    'absolute session expiry in %s uses the allowed %s task outcome', async (status, expected) => {
+      mockDdbSend.mockResolvedValueOnce({ Item: { ...vmTask(), status } }).mockResolvedValue({});
+      await finalizeTask('TASK001', {
+        attempts: 2000, microvmSupervisor: supervisor, microvmFailureReason: 'session-deadline',
+      }, 'user-123');
+      expect(mockDdbSend.mock.calls[1][0].input.ExpressionAttributeValues[':toStatus']).toBe(expected);
+    },
+  );
+
+  test('the legacy approval poll timeout also uses FAILED without changing the approval decision', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: vmTask() }).mockResolvedValue({});
+    await finalizeTask('TASK001', { attempts: 1020 }, 'user-123');
+    expect(mockDdbSend.mock.calls[1][0].input.ExpressionAttributeValues[':toStatus']).toBe('FAILED');
+    expect(mockDdbSend.mock.calls[2][0].input.Item.event_type).toBe('task_failed');
+  });
+
+  test.each([
+    ['FAILED', 'HYDRATING'],
+    ['CANCELLED', 'RUNNING'],
+  ])('honors committed %s instead of stale %s during immediate finalization', async (committed, stale) => {
+    mockDdbSend.mockImplementation(async (command) => {
+      if (command._type === 'Get') {
+        return {
+          Item: {
+            ...baseTask,
+            status: command.input.ConsistentRead ? committed : stale,
+            memory_written: true,
+          },
+        };
+      }
+      // A stale transition loses to the terminal status already in DynamoDB.
+      if (command.input.ExpressionAttributeValues?.[':fromStatus']) {
+        throw Object.assign(new Error('terminal state already committed'), { name: 'ConditionalCheckFailedException' });
+      }
+      return {};
+    });
+    await finalizeTask('TASK001', { attempts: 0 }, 'user-123');
+    const events = mockDdbSend.mock.calls
+      .filter(([command]) => command._type === 'Put')
+      .map(([command]) => command.input.Item);
+    expect(events).toEqual([expect.objectContaining({
+      event_type: `task_${committed.toLowerCase()}`,
+      metadata: expect.objectContaining({ final_status: committed }),
+    })]);
+    expect(mockDdbSend.mock.calls.some(([command]) =>
+      command.input.ExpressionAttributeValues?.[':fromStatus'])).toBe(false);
+  });
+  test('handles already-terminal task', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED' } }) // loadTask
+      .mockResolvedValue({}); // emitTaskEvent + decrementConcurrency
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    // Verify emitTaskEvent was called (PutCommand)
+    expect(mockDdbSend).toHaveBeenCalled();
+  });
+
+  test('transitions RUNNING to FAILED when pollState.sessionUnhealthy', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'RUNNING' } }) // loadTask
+      .mockResolvedValue({}); // transitionTask + emitTaskEvent + decrementConcurrency
+    await finalizeTask(
+      'TASK001',
+      { attempts: 12, lastStatus: 'RUNNING', sessionUnhealthy: true },
+      'user-123',
+    );
+    const transitionCall = mockDdbSend.mock.calls[1][0];
+    expect(transitionCall.input.ExpressionAttributeValues[':toStatus']).toBe('FAILED');
+    expect(transitionCall.input.ExpressionAttributeValues[':fromStatus']).toBe('RUNNING');
+    const eventCall = mockDdbSend.mock.calls[2][0];
+    expect(eventCall.input.Item.event_type).toBe('task_failed');
+    expect(eventCall.input.Item.metadata.reason).toBe('agent_heartbeat_stale');
+    // Terminal event carries the correlation envelope (#245).
+    expect(eventCall.input.Item).toMatchObject({ user_id: 'user-123', repo: 'org/repo' });
+  });
+
+  // --- substrate noun in the heartbeat-stale message (ayushtr nit 5) ---
+  //
+  // The message hard-coded "container", which was true for the only two backends
+  // that existed when it was written and became false the moment `lambda-microvm`
+  // joined the heartbeat path: a MicroVM has no container, so the copy sent the
+  // operator looking for one. Same defect class as "substrate state completed".
+
+  test.each([
+    ['lambda-microvm', 'the MicroVM'],
+    ['ecs', 'the container'],
+    ['agentcore', 'the container'],
+  ])('names the right substrate in the heartbeat-stale message for %s', async (computeType, noun) => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'RUNNING', compute_type: computeType } })
+      .mockResolvedValue({});
+
+    await finalizeTask(
+      'TASK001',
+      { attempts: 12, lastStatus: 'RUNNING', sessionUnhealthy: true },
+      'user-123',
+    );
+
+    const message = mockDdbSend.mock.calls[1][0].input
+      .ExpressionAttributeValues[':attr_error_message'] as string;
+    expect(message).toBe(
+      `Agent session lost: no recent heartbeat from the agent (${noun} may have crashed, `
+      + 'been OOM-killed, or stopped)',
+    );
+  });
+
+  test('degrades to a true generic on a record with no compute_type', async () => {
+    // `compute_type` is optional on TaskRecord (absent on older records), and the
+    // fallback must be accurate rather than a guess at the likely backend.
+    const { compute_type: _dropped, ...noComputeType } = { ...baseTask, compute_type: 'ecs' };
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...noComputeType, status: 'RUNNING' } })
+      .mockResolvedValue({});
+
+    await finalizeTask(
+      'TASK001',
+      { attempts: 12, lastStatus: 'RUNNING', sessionUnhealthy: true },
+      'user-123',
+    );
+
+    const message = mockDdbSend.mock.calls[1][0].input
+      .ExpressionAttributeValues[':attr_error_message'] as string;
+    expect(message).toContain('(the runtime may have crashed');
+    // ...and the sentence does not stutter. The prefix names WHO stopped beating
+    // (the agent); the parenthetical names WHAT it was running on. When the noun
+    // degrades to the generic "the runtime", a prefix that also said "the runtime"
+    // produced "no recent heartbeat from the runtime (the runtime may have…)".
+    expect(message).toBe(
+      'Agent session lost: no recent heartbeat from the agent '
+      + '(the runtime may have crashed, been OOM-killed, or stopped)',
+    );
+  });
+
+  test('the heartbeat-stale message still classifies as a lost session', async () => {
+    // The noun swap must not break the classifier pattern.
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'RUNNING', compute_type: 'lambda-microvm' } })
+      .mockResolvedValue({});
+    await finalizeTask(
+      'TASK001',
+      { attempts: 12, lastStatus: 'RUNNING', sessionUnhealthy: true },
+      'user-123',
+    );
+    const message = mockDdbSend.mock.calls[1][0].input
+      .ExpressionAttributeValues[':attr_error_message'] as string;
+
+    expect(classifyError(message)!.title).toBe('Agent session lost');
+  });
+
+  test('transitions RUNNING to TIMED_OUT on poll timeout', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'RUNNING' } }) // loadTask
+      .mockResolvedValue({}); // transitionTask + emitTaskEvent + decrementConcurrency
+    await finalizeTask('TASK001', { attempts: 1020, lastStatus: 'RUNNING' }, 'user-123');
+    expect(mockDdbSend).toHaveBeenCalled();
+  });
+
+  test('transitions HYDRATING to FAILED when session never started', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'HYDRATING' } }) // loadTask
+      .mockResolvedValue({}); // transitionTask + emitTaskEvent + decrementConcurrency
+    await finalizeTask('TASK001', { attempts: 15, lastStatus: 'HYDRATING' }, 'user-123');
+    // First call: loadTask, second call: transitionTask (HYDRATING -> FAILED)
+    const transitionCall = mockDdbSend.mock.calls[1][0];
+    expect(transitionCall.input.ExpressionAttributeValues[':toStatus']).toBe('FAILED');
+    expect(transitionCall.input.ExpressionAttributeValues[':fromStatus']).toBe('HYDRATING');
+    // Third call: emitTaskEvent (task_failed with session_never_started)
+    const eventCall = mockDdbSend.mock.calls[2][0];
+    expect(eventCall.input.Item.event_type).toBe('task_failed');
+    expect(eventCall.input.Item.metadata.reason).toBe('session_never_started');
+  });
+
+  test('releases concurrency for unexpected task state', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'SUBMITTED' } }) // loadTask
+      .mockResolvedValue({}); // decrementConcurrency
+    await finalizeTask('TASK001', { attempts: 5, lastStatus: 'SUBMITTED' }, 'user-123');
+    // Should still call decrementConcurrency (UpdateCommand for user concurrency)
+    const lastCall = mockDdbSend.mock.calls[mockDdbSend.mock.calls.length - 1][0];
+    expect(lastCall.input.Key).toEqual({ user_id: 'user-123' });
+  });
+
+  test('resolves without throwing when decrementConcurrency hits ConditionalCheckFailedException', async () => {
+    const condErr = new Error('Conditional check failed');
+    condErr.name = 'ConditionalCheckFailedException';
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED', memory_written: true } }) // loadTask
+      .mockResolvedValueOnce({}) // TTL stamp
+      .mockResolvedValueOnce({}) // emitTaskEvent
+      .mockRejectedValueOnce(condErr); // decrementConcurrency CCF
+    await expect(finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123')).resolves.toBe(true);
+  });
+
+  test('resolves without throwing when decrementConcurrency hits a non-CCF error', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED', memory_written: true } }) // loadTask
+      .mockResolvedValueOnce({}) // TTL stamp
+      .mockResolvedValueOnce({}) // emitTaskEvent
+      .mockRejectedValueOnce(new Error('DDB timeout')); // decrementConcurrency non-CCF
+    await expect(finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123')).resolves.toBe(true);
+  });
+});
+
+describe('failTask', () => {
+  test('transitions to FAILED and emits event', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await failTask('TASK001', 'SUBMITTED', 'concurrency limit', 'user-123', false);
+    expect(mockDdbSend).toHaveBeenCalled();
+  });
+
+  test('releases concurrency when requested', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await failTask('TASK001', 'HYDRATING', 'hydration error', 'user-123', true);
+    // transitionTask + emitTaskEvent + decrementConcurrency = 3 calls
+    expect(mockDdbSend).toHaveBeenCalledTimes(3);
+  });
+
+  test('transitions from HYDRATING to FAILED when called with HYDRATING status', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await failTask('TASK001', 'HYDRATING', 'Guardrail blocked: PR context blocked by content policy', 'user-123', true);
+    // First call: transitionTask UpdateCommand
+    const transitionCall = mockDdbSend.mock.calls[0][0];
+    expect(transitionCall.input.ExpressionAttributeValues[':fromStatus']).toBe('HYDRATING');
+    expect(transitionCall.input.ExpressionAttributeValues[':toStatus']).toBe('FAILED');
+  });
+
+  test('handles transition failure gracefully without emitting when not transitioned', async () => {
+    mockDdbSend.mockRejectedValueOnce(new Error('Condition failed')); // transitionTask only
+    await expect(failTask('TASK001', 'SUBMITTED', 'error', 'user-123', false)).resolves.toBeUndefined();
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+  });
+
+  test('second failTask does not re-emit or re-decrement when transition fails (idempotent under step retry)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await failTask('TASK001', 'HYDRATING', 'first failure', 'user-123', true);
+    expect(mockDdbSend).toHaveBeenCalledTimes(3); // transition + emit + decrement
+
+    mockDdbSend.mockClear();
+    const condErr = new Error('The conditional request failed');
+    condErr.name = 'ConditionalCheckFailedException';
+    mockDdbSend.mockRejectedValueOnce(condErr); // already FAILED — transition no-ops
+
+    await expect(failTask('TASK001', 'HYDRATING', 'durable replay', 'user-123', true)).resolves.toBeUndefined();
+    expect(mockDdbSend).toHaveBeenCalledTimes(1); // transition attempt only; no Put, no concurrency Update
+  });
+});
+
+describe('queueTask (#441 admission queue)', () => {
+  test('transitions SUBMITTED -> QUEUED, stamps queued_at + admission_attempts, emits admission_queued', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const result = await queueTask(baseTask as any);
+    expect(result).toBe(true);
+
+    const transition = mockDdbSend.mock.calls[0][0];
+    expect(transition._type).toBe('Update');
+    expect(transition.input.ExpressionAttributeValues[':fromStatus']).toBe('SUBMITTED');
+    expect(transition.input.ExpressionAttributeValues[':toStatus']).toBe('QUEUED');
+    // First queue entry stamps queued_at and attempts=1
+    expect(transition.input.ExpressionAttributeValues[':attr_queued_at']).toBeDefined();
+    expect(transition.input.ExpressionAttributeValues[':attr_admission_attempts']).toBe(1);
+
+    const event = mockDdbSend.mock.calls[1][0];
+    expect(event._type).toBe('Put');
+    expect(event.input.Item.event_type).toBe('admission_queued');
+    expect(event.input.Item.metadata.reason).toBe('concurrency_limit');
+  });
+
+  test('re-queue preserves original queued_at and increments admission_attempts', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const requeued = { ...baseTask, queued_at: '2024-01-01T00:00:00Z', admission_attempts: 2 };
+    await queueTask(requeued as any);
+
+    const transition = mockDdbSend.mock.calls[0][0];
+    // queued_at already set — must NOT be overwritten
+    expect(transition.input.ExpressionAttributeValues[':attr_queued_at']).toBeUndefined();
+    expect(transition.input.ExpressionAttributeValues[':attr_admission_attempts']).toBe(3);
+  });
+
+  test('returns false without emitting when a concurrent transition wins the conditional check', async () => {
+    const condErr = new Error('The conditional request failed');
+    condErr.name = 'ConditionalCheckFailedException';
+    mockDdbSend.mockRejectedValueOnce(condErr);
+
+    const result = await queueTask(baseTask as any);
+    expect(result).toBe(false);
+    expect(mockDdbSend).toHaveBeenCalledTimes(1); // transition attempt only, no event
+  });
+
+  test('rethrows unexpected DDB errors so the durable step retries', async () => {
+    mockDdbSend.mockRejectedValueOnce(new Error('DDB timeout'));
+    await expect(queueTask(baseTask as any)).rejects.toThrow('DDB timeout');
+  });
+
+  test('never touches the concurrency counter (no slot held while QUEUED)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await queueTask(baseTask as any);
+    for (const call of mockDdbSend.mock.calls) {
+      expect(call[0].input.TableName).not.toBe('UserConcurrency');
+    }
+  });
+});
+
+describe('emitTaskEvent', () => {
+  test('writes event to DynamoDB with TTL', async () => {
+    mockDdbSend.mockResolvedValueOnce({});
+    await emitTaskEvent('TASK001', 'task_created', { repo: 'org/repo' });
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+    const putCall = mockDdbSend.mock.calls[0][0];
+    expect(putCall.input.Item.ttl).toBeDefined();
+    expect(typeof putCall.input.Item.ttl).toBe('number');
+    expect(putCall.input.Item.ttl).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+});
+
+describe('transitionTask', () => {
+  test('rejects invalid transitions', async () => {
+    await expect(transitionTask('TASK001', 'COMPLETED' as any, 'RUNNING' as any)).rejects.toThrow(
+      'Invalid transition: COMPLETED -> RUNNING',
+    );
+    expect(mockDdbSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('transitionTask TTL stamping', () => {
+  test('stamps TTL when transitioning to terminal state FAILED', async () => {
+    mockDdbSend.mockResolvedValueOnce({}); // UpdateCommand
+    // Use failTask which calls transitionTask with FAILED
+    mockDdbSend.mockResolvedValue({}); // remaining calls
+    await failTask('TASK001', 'SUBMITTED', 'concurrency limit', 'user-123', false);
+    // First call is transitionTask UpdateCommand
+    const updateCall = mockDdbSend.mock.calls[0][0];
+    expect(updateCall.input.UpdateExpression).toContain('#ttl = :ttl');
+    expect(updateCall.input.ExpressionAttributeNames['#ttl']).toBe('ttl');
+    expect(typeof updateCall.input.ExpressionAttributeValues[':ttl']).toBe('number');
+  });
+});
+
+describe('finalizeTask TTL stamping', () => {
+  test('stamps TTL on task already in terminal state', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED' } }) // loadTask
+      .mockResolvedValue({}); // UpdateCommand (TTL stamp) + emitTaskEvent + decrementConcurrency
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    // Second call should be the TTL stamp UpdateCommand
+    const ttlStampCall = mockDdbSend.mock.calls[1][0];
+    expect(ttlStampCall.input.UpdateExpression).toBe('SET #ttl = :ttl');
+    expect(ttlStampCall.input.ExpressionAttributeNames['#ttl']).toBe('ttl');
+    expect(typeof ttlStampCall.input.ExpressionAttributeValues[':ttl']).toBe('number');
+  });
+
+  test('continues if TTL stamp fails', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED' } }) // loadTask
+      .mockRejectedValueOnce(new Error('DDB error')) // TTL stamp fails
+      .mockResolvedValue({}); // emitTaskEvent + decrementConcurrency
+    // Should not throw
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    expect(mockDdbSend).toHaveBeenCalled();
+  });
+});
+
+describe('hydrateAndTransition — memory and prompt version', () => {
+  // MEMORY_ID='mem-test-default' is set before module import and captured as a const.
+  const mockHydratedContextBase = {
+    version: 1,
+    user_prompt: 'Task ID: TASK001\nRepository: org/repo\n\n## Task\n\nFix the bug',
+    sources: ['task_description'],
+    token_estimate: 20,
+    truncated: false,
+    content_trust: { task_description: 'trusted' },
+  };
+
+  test('passes memoryId to hydrateContext', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContextBase);
+    await hydrateAndTransition(baseTask as any);
+    expect(mockHydrateContext).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ memoryId: 'mem-test-default' }),
+    );
+  });
+
+  test('includes prompt_version and memory_id in payload', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContextBase);
+    const payload = await hydrateAndTransition(baseTask as any);
+    expect(payload.prompt_version).toBe('abc123def456');
+    expect(payload.memory_id).toBe('mem-test-default');
+  });
+
+  test('hydration_complete event includes has_memory_context when memory is loaded', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce({
+      ...mockHydratedContextBase,
+      memory_context: { repo_knowledge: ['test'], past_episodes: [] },
+      sources: ['task_description', 'memory'],
+      content_trust: { task_description: 'trusted', memory: 'memory' },
+    });
+    await hydrateAndTransition(baseTask as any);
+
+    const putCalls = mockDdbSend.mock.calls.filter(
+      (call: any[]) => call[0]._type === 'Put' && call[0].input?.Item?.event_type === 'hydration_complete',
+    );
+    expect(putCalls).toHaveLength(1);
+    const metadata = putCalls[0][0].input.Item.metadata;
+    expect(metadata.has_memory_context).toBe(true);
+    expect(metadata.prompt_version).toBe('abc123def456');
+    expect(metadata.content_trust).toEqual({ task_description: 'trusted', memory: 'memory' });
+  });
+
+  test('stores prompt_version on task record via DDB UpdateCommand', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContextBase);
+    await hydrateAndTransition(baseTask as any);
+
+    // Find the UpdateCommand that stores prompt_version
+    const updateCalls = mockDdbSend.mock.calls.filter(
+      (call: any[]) => call[0]._type === 'Update' && call[0].input?.ExpressionAttributeNames?.['#pv'] === 'prompt_version',
+    );
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0][0].input.ExpressionAttributeValues[':pv']).toBe('abc123def456');
+  });
+
+  const issueTitleUpdates = () => mockDdbSend.mock.calls.filter(
+    (call: any[]) => call[0]._type === 'Update' && call[0].input?.ExpressionAttributeNames?.['#it'] === 'issue_title',
+  );
+
+  test('stores the hydrated issue title on the task record, trimmed and capped', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce({
+      ...mockHydratedContextBase,
+      issue: { number: 3, title: `  Encounter and catch monsters${'!'.repeat(400)}  `, body: '', comments: [] },
+    });
+    await hydrateAndTransition(baseTask as any);
+
+    const updates = issueTitleUpdates();
+    expect(updates).toHaveLength(1);
+    const stored = updates[0][0].input.ExpressionAttributeValues[':it'];
+    expect(stored.startsWith('Encounter and catch monsters')).toBe(true);
+    expect(stored).toHaveLength(ISSUE_TITLE_MAX_LENGTH);
+  });
+
+  test('writes no issue title when the task has no issue', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContextBase);
+    await hydrateAndTransition(baseTask as any);
+    expect(issueTitleUpdates()).toHaveLength(0);
+  });
+
+  test('carries on when storing the issue title fails', async () => {
+    mockDdbSend.mockImplementation(async (cmd: any) => {
+      if (cmd.input?.ExpressionAttributeNames?.['#it'] === 'issue_title') throw new Error('throttled');
+      return {};
+    });
+    mockHydrateContext.mockResolvedValueOnce({
+      ...mockHydratedContextBase,
+      issue: { number: 3, title: 'Encounter and catch monsters', body: '', comments: [] },
+    });
+    await expect(hydrateAndTransition(baseTask as any)).resolves.toBeDefined();
+    expect(issueTitleUpdates()).toHaveLength(1);
+  });
+});
+
+describe('finalizeTask — memory fallback', () => {
+  // MEMORY_ID='mem-test-default' is set before module import and captured as a const.
+  test('calls writeMinimalEpisode when memory_written is false', async () => {
+    mockWriteMinimalEpisode.mockResolvedValueOnce(true);
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED', memory_written: false } })
+      .mockResolvedValue({});
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    expect(mockWriteMinimalEpisode).toHaveBeenCalledWith(
+      'mem-test-default', 'org/repo', 'TASK001', 'COMPLETED', undefined, undefined,
+    );
+  });
+
+  test('skips writeMinimalEpisode when memory_written is true', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED', memory_written: true } })
+      .mockResolvedValue({});
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    expect(mockWriteMinimalEpisode).not.toHaveBeenCalled();
+  });
+
+  test('survives writeMinimalEpisode failure (fail-open)', async () => {
+    mockWriteMinimalEpisode.mockRejectedValueOnce(new Error('Access denied'));
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED', memory_written: false } })
+      .mockResolvedValue({});
+    // Should not throw — the try-catch in finalizeTask prevents crash
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    expect(mockWriteMinimalEpisode).toHaveBeenCalled();
+    // decrementConcurrency should still be called (last UpdateCommand for user concurrency)
+    const lastCall = mockDdbSend.mock.calls[mockDdbSend.mock.calls.length - 1][0];
+    expect(lastCall.input.Key).toEqual({ user_id: 'user-123' });
+  });
+
+  test('converts string duration_s and cost_usd to numbers', async () => {
+    mockWriteMinimalEpisode.mockResolvedValueOnce(true);
+    mockDdbSend
+      .mockResolvedValueOnce({
+        Item: { ...baseTask, status: 'COMPLETED', memory_written: false, duration_s: '123.4', cost_usd: '0.0567' },
+      })
+      .mockResolvedValue({});
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    expect(mockWriteMinimalEpisode).toHaveBeenCalledWith(
+      'mem-test-default', 'org/repo', 'TASK001', 'COMPLETED', 123.4, 0.0567,
+    );
+  });
+
+  test('logs warning when writeMinimalEpisode returns false', async () => {
+    mockWriteMinimalEpisode.mockResolvedValueOnce(false);
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseTask, status: 'COMPLETED', memory_written: false } })
+      .mockResolvedValue({});
+    // Should complete without throwing
+    await finalizeTask('TASK001', { attempts: 10, lastStatus: 'COMPLETED' }, 'user-123');
+    expect(mockWriteMinimalEpisode).toHaveBeenCalled();
+  });
+});
+
+describe('exclusive deployment routing', () => {
+  const original = process.env.DEPLOYED_COMPUTE_TYPE;
+  afterEach(() => {
+    if (original === undefined) delete process.env.DEPLOYED_COMPUTE_TYPE;
+    else process.env.DEPLOYED_COMPUTE_TYPE = original;
+  });
+  test.each(['agentcore', 'ecs', 'lambda-microvm'])('inherits %s for unpinned and repo-less tasks', async backend => {
+    process.env.DEPLOYED_COMPUTE_TYPE = backend;
+    expect((await loadBlueprintConfig(baseTask as any)).compute_type).toBe(backend);
+    expect((await loadBlueprintConfig({ ...baseTask, repo: undefined } as any)).compute_type).toBe(backend);
+  });
+  test('rejects a stored backend override that is no longer deployed', async () => {
+    process.env.DEPLOYED_COMPUTE_TYPE = 'ecs';
+    mockLoadRepoConfig.mockResolvedValueOnce({ compute_type: 'agentcore' });
+    await expect(loadBlueprintConfig(baseTask as any)).rejects.toThrow(/is not deployed/);
+  });
+});

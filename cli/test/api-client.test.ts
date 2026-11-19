@@ -1,0 +1,680 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import { ApiClient } from '../src/api-client';
+import { getAuthToken } from '../src/auth';
+import { ApiError } from '../src/errors';
+
+// Mock auth
+jest.mock('../src/auth', () => ({
+  getAuthToken: jest.fn().mockResolvedValue('mock-token'),
+}));
+
+const mockGetAuthToken = getAuthToken as jest.Mock;
+
+// Mock config
+jest.mock('../src/config', () => ({
+  loadConfig: jest.fn().mockReturnValue({
+    api_url: 'https://api.example.com',
+    region: 'us-east-1',
+    user_pool_id: 'pool-id',
+    client_id: 'client-id',
+  }),
+}));
+
+// Mock fetch
+const mockFetch = jest.fn();
+global.fetch = mockFetch as unknown as typeof fetch;
+
+describe('ApiClient', () => {
+  let client: ApiClient;
+
+  beforeEach(() => {
+    client = new ApiClient();
+    mockFetch.mockReset();
+  });
+
+  describe('createTask', () => {
+    test('sends POST and returns task detail', async () => {
+      const taskDetail = { task_id: 'abc', status: 'SUBMITTED', repo: 'owner/repo' };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: taskDetail }),
+      });
+
+      const result = await client.createTask({ repo: 'owner/repo', issue_number: 1 });
+      expect(result).toEqual(taskDetail);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/tasks',
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    test('sends idempotency key header', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { task_id: 'abc' } }),
+      });
+
+      await client.createTask({ repo: 'owner/repo', task_description: 'test' }, 'my-key');
+      const call = mockFetch.mock.calls[0];
+      expect(call[1].headers['Idempotency-Key']).toBe('my-key');
+    });
+  });
+
+  describe('listTasks', () => {
+    test('sends GET with query params', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      const result = await client.listTasks({ status: 'RUNNING', limit: 5 });
+      expect(result).toEqual(response);
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('status=RUNNING'),
+        expect.anything(),
+      );
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('limit=5'),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('getPersonalBudget', () => {
+    test('uses the authenticated budget view on the existing tasks endpoint', async () => {
+      const budget = {
+        period: '2026-08',
+        resets_at: '2026-09-01T00:00:00.000Z',
+        configured: true,
+        spend_usd: 25,
+        monthly_limit_usd: 100,
+        remaining_usd: 75,
+        utilization_percent: 25,
+        hard_stop: true,
+        hard_stop_active: false,
+      };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: budget }),
+      });
+
+      await expect(client.getPersonalBudget()).resolves.toEqual(budget);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/tasks?view=budget',
+        expect.objectContaining({ method: 'GET' }),
+      );
+      expect(mockGetAuthToken).toHaveBeenCalled();
+    });
+  });
+
+  describe('getTask', () => {
+    test('sends GET with task ID', async () => {
+      const taskDetail = { task_id: 'abc' };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: taskDetail }),
+      });
+
+      const result = await client.getTask('abc');
+      expect(result).toEqual(taskDetail);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/tasks/abc',
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('getTraceUrl', () => {
+    test('sends GET to /tasks/{id}/trace and returns the presigned URL envelope', async () => {
+      const payload = {
+        url: 'https://s3.example/trace?sig=abc',
+        expires_at: '2026-04-30T20:15:00Z',
+      };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: payload }),
+      });
+
+      const result = await client.getTraceUrl('abc');
+      expect(result).toEqual(payload);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/tasks/abc/trace',
+        expect.objectContaining({ method: 'GET' }),
+      );
+    });
+
+    test('URL-encodes task_id', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { url: 'x', expires_at: 'y' } }),
+      });
+      await client.getTraceUrl('weird/id with space');
+      const calledUrl = (mockFetch.mock.calls[0] as [string, unknown])[0];
+      expect(calledUrl).toContain(encodeURIComponent('weird/id with space'));
+    });
+  });
+
+  describe('cancelTask', () => {
+    test('sends DELETE', async () => {
+      const cancelResponse = { task_id: 'abc', status: 'CANCELLED', cancelled_at: '2026-01-01T00:00:00Z' };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: cancelResponse }),
+      });
+
+      const result = await client.cancelTask('abc');
+      expect(result).toEqual(cancelResponse);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/tasks/abc',
+        expect.objectContaining({ method: 'DELETE' }),
+      );
+    });
+  });
+
+  describe('linearRemoveWorkspace', () => {
+    const okBody = {
+      ok: true,
+      json: async () => ({
+        data: {
+          workspace_slug: 'acme',
+          linear_workspace_id: 'ws-1',
+          status: 'revoked',
+          secret: 'deleted',
+        },
+      }),
+    };
+
+    test('sends DELETE to /linear/workspaces/{slug} with no query string by default', async () => {
+      mockFetch.mockResolvedValue(okBody);
+      await client.linearRemoveWorkspace('acme');
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/linear/workspaces/acme',
+        expect.objectContaining({ method: 'DELETE' }),
+      );
+    });
+
+    test('maps --purge to the snake_case query param (matches handler reads)', async () => {
+      mockFetch.mockResolvedValue(okBody);
+      await client.linearRemoveWorkspace('acme', { purge: true });
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('purge=true');
+    });
+
+    test('URL-encodes the slug', async () => {
+      mockFetch.mockResolvedValue(okBody);
+      await client.linearRemoveWorkspace('a b');
+      expect(mockFetch.mock.calls[0][0]).toContain('/linear/workspaces/a%20b');
+    });
+  });
+
+  describe('getTaskEvents', () => {
+    test('sends GET to events endpoint', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      const result = await client.getTaskEvents('abc', { limit: 10 });
+      expect(result).toEqual(response);
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/tasks/abc/events'),
+        expect.anything(),
+      );
+    });
+
+    test('passes ?after= when provided', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      const ulid = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+      await client.getTaskEvents('abc', { after: ulid });
+
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('/tasks/abc/events');
+      expect(url).toContain(`after=${ulid}`);
+      // Must not silently send next_token when only after was provided.
+      expect(url).not.toContain('next_token=');
+    });
+
+    test('existing next_token path is preserved', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      await client.getTaskEvents('abc', { nextToken: 'opaque-token', limit: 25 });
+
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('next_token=opaque-token');
+      expect(url).toContain('limit=25');
+      expect(url).not.toContain('after=');
+    });
+
+    test('passes ?desc=1 when desc=true is provided', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      await client.getTaskEvents('abc', { limit: 20, desc: true });
+
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('desc=1');
+      expect(url).toContain('limit=20');
+      // ``desc: false`` MUST NOT leak as ``desc=0`` or ``desc=false`` —
+      // the server treats anything truthy-looking as opt-in.
+    });
+
+    test('omits desc when desc is falsy or absent', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      await client.getTaskEvents('abc', { limit: 5, desc: false });
+
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).not.toContain('desc=');
+    });
+
+    test('both after and nextToken are sent verbatim to the server', async () => {
+      // The client does not arbitrate — the server prefers ``after`` and logs
+      // a warning. This test just locks in the transport behaviour.
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      await client.getTaskEvents('abc', {
+        after: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        nextToken: 'opaque',
+      });
+
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('after=01ARZ3NDEKTSV4RRFFQ69G5FAV');
+      expect(url).toContain('next_token=opaque');
+    });
+  });
+
+  describe('catchUpEvents', () => {
+    test('returns first page when server says no more', async () => {
+      const events = [
+        { event_id: '01ARZ3NDEKTSV4RRFFQ69G5FB0', event_type: 'agent_turn', timestamp: 't1', metadata: {} },
+        { event_id: '01ARZ3NDEKTSV4RRFFQ69G5FB1', event_type: 'agent_turn', timestamp: 't2', metadata: {} },
+      ];
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: events,
+          pagination: { next_token: null, has_more: false },
+        }),
+      });
+
+      const result = await client.catchUpEvents('abc', '01ARZ3NDEKTSV4RRFFQ69G5FAV');
+      expect(result).toEqual(events);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('after=01ARZ3NDEKTSV4RRFFQ69G5FAV');
+    });
+
+    test('paginates internally across multiple next_token hops', async () => {
+      const pageA = [
+        { event_id: 'E1', event_type: 'agent_turn', timestamp: 't1', metadata: {} },
+      ];
+      const pageB = [
+        { event_id: 'E2', event_type: 'agent_turn', timestamp: 't2', metadata: {} },
+      ];
+      const pageC = [
+        { event_id: 'E3', event_type: 'agent_turn', timestamp: 't3', metadata: {} },
+      ];
+
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: pageA, pagination: { next_token: 'tok-1', has_more: true } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: pageB, pagination: { next_token: 'tok-2', has_more: true } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: pageC, pagination: { next_token: null, has_more: false } }),
+        });
+
+      const result = await client.catchUpEvents('abc', '01ARZ3NDEKTSV4RRFFQ69G5FAV');
+      expect(result.map(e => e.event_id)).toEqual(['E1', 'E2', 'E3']);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+
+      // First call: uses after
+      const url1 = mockFetch.mock.calls[0][0] as string;
+      expect(url1).toContain('after=01ARZ3NDEKTSV4RRFFQ69G5FAV');
+      // Second and third: use next_token (no after)
+      const url2 = mockFetch.mock.calls[1][0] as string;
+      expect(url2).toContain('next_token=tok-1');
+      expect(url2).not.toContain('after=');
+      const url3 = mockFetch.mock.calls[2][0] as string;
+      expect(url3).toContain('next_token=tok-2');
+      expect(url3).not.toContain('after=');
+    });
+
+    test('returns empty array when server reports no events after cursor', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [],
+          pagination: { next_token: null, has_more: false },
+        }),
+      });
+
+      const result = await client.catchUpEvents('abc', '01ARZ3NDEKTSV4RRFFQ69G5FAV');
+      expect(result).toEqual([]);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('AbortSignal propagation', () => {
+    test('threads signal through request() into fetch()', async () => {
+      // Regression guard: if a refactor ever drops ``signal`` from the
+      // fetch options, ``bgagent watch`` Ctrl+C becomes unresponsive
+      // because in-flight requests would have to time out before the
+      // loop could exit. This test proves the plumbing end-to-end at
+      // the HTTP boundary.
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { task_id: 'abc' } }),
+      });
+
+      const controller = new AbortController();
+      await client.getTask('abc', { signal: controller.signal });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ signal: controller.signal }),
+      );
+    });
+
+    test('threads signal through getTaskEvents() and catchUpEvents() into fetch()', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [], pagination: { next_token: null, has_more: false } }),
+      });
+
+      const controller = new AbortController();
+      await client.getTaskEvents('abc', { signal: controller.signal });
+      await client.catchUpEvents('abc', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 100, { signal: controller.signal });
+
+      // Every fetch the client issued must carry the same signal.
+      const calls = mockFetch.mock.calls;
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+      for (const [, init] of calls) {
+        expect((init as RequestInit).signal).toBe(controller.signal);
+      }
+    });
+
+    test('throws ApiError (not CliError) for non-JSON 4xx body so callers can classify', async () => {
+      // Regression guard for Chunk H: WAF / CloudFront HTML error pages
+      // used to come back as CliError without a status, defeating the
+      // watch retry loop's 4xx-vs-5xx classification. Non-JSON HTTP
+      // errors must still be ApiError so ``isTransientError`` can see
+      // the 4xx status and NOT retry.
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: async () => { throw new SyntaxError('Unexpected token <'); },
+      });
+
+      const err: unknown = await client.getTask('abc').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).statusCode).toBe(403);
+    });
+  });
+
+  describe('getStatusSnapshot', () => {
+    test('runs getTask and getTaskEvents(desc=1) in parallel and returns both', async () => {
+      const taskDetail = { task_id: 'abc', status: 'RUNNING' };
+      const events = [
+        { event_id: 'E2', event_type: 'agent_tool_call', timestamp: 't2', metadata: { tool_name: 'Bash' } },
+        { event_id: 'E1', event_type: 'agent_turn', timestamp: 't1', metadata: { turn: 3 } },
+      ];
+      mockFetch
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ data: taskDetail }) })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: events, pagination: { next_token: null, has_more: false } }),
+        });
+
+      const result = await client.getStatusSnapshot('abc');
+
+      expect(result.task).toEqual(taskDetail);
+      expect(result.recentEvents).toEqual(events);
+
+      // Two HTTP calls; the events call must carry ``desc=1`` and a bounded limit.
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const urls = mockFetch.mock.calls.map(c => c[0] as string);
+      expect(urls.some(u => u === 'https://api.example.com/tasks/abc')).toBe(true);
+      const eventsUrl = urls.find(u => u.includes('/events'));
+      expect(eventsUrl).toBeDefined();
+      expect(eventsUrl).toContain('desc=1');
+      expect(eventsUrl).toContain('limit=20');
+    });
+
+    test('surfaces a getTask failure from the parallel pair', async () => {
+      // Regression guard against a future refactor to ``Promise.allSettled``
+      // that would silently render a broken snapshot. The current contract
+      // is fail-fast: if either leg errors, the CLI surfaces the error.
+      mockFetch
+        .mockRejectedValueOnce(new Error('network down'))
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: [], pagination: { next_token: null, has_more: false } }),
+        });
+
+      await expect(client.getStatusSnapshot('abc')).rejects.toThrow('network down');
+    });
+
+    test('honors a custom recentEventLimit', async () => {
+      mockFetch
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { task_id: 'abc' } }) })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: [], pagination: { next_token: null, has_more: false } }),
+        });
+
+      await client.getStatusSnapshot('abc', 5);
+
+      const eventsUrl = mockFetch.mock.calls.map(c => c[0] as string).find(u => u.includes('/events'));
+      expect(eventsUrl).toContain('limit=5');
+    });
+  });
+
+  describe('createWebhook', () => {
+    test('sends POST and returns webhook response', async () => {
+      const webhookResponse = { webhook_id: 'wh-1', name: 'My CI', secret: 'sec-123', created_at: '2026-01-01T00:00:00Z' };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: webhookResponse }),
+      });
+
+      const result = await client.createWebhook({ name: 'My CI' });
+      expect(result).toEqual(webhookResponse);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/webhooks',
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+  });
+
+  describe('listWebhooks', () => {
+    test('sends GET with query params', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      const result = await client.listWebhooks({ includeRevoked: true, limit: 10 });
+      expect(result).toEqual(response);
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('include_revoked=true'),
+        expect.anything(),
+      );
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('limit=10'),
+        expect.anything(),
+      );
+    });
+
+    test('sends GET without query params when no options', async () => {
+      const response = { data: [], pagination: { next_token: null, has_more: false } };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => response,
+      });
+
+      await client.listWebhooks();
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/webhooks',
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('revokeWebhook', () => {
+    test('sends DELETE and returns webhook detail', async () => {
+      const webhookDetail = {
+        webhook_id: 'wh-1',
+        name: 'My CI',
+        status: 'revoked',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T01:00:00Z',
+        revoked_at: '2026-01-01T01:00:00Z',
+      };
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: webhookDetail }),
+      });
+
+      const result = await client.revokeWebhook('wh-1');
+      expect(result).toEqual(webhookDetail);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/webhooks/wh-1',
+        expect.objectContaining({ method: 'DELETE' }),
+      );
+    });
+  });
+
+  describe('error handling', () => {
+    test('throws ApiError on error response', async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        json: async () => ({
+          error: { code: 'TASK_NOT_FOUND', message: 'Task not found', request_id: 'req-1' },
+        }),
+      });
+
+      await expect(client.getTask('bad-id')).rejects.toThrow(ApiError);
+    });
+
+    test('includes login hint on 401', async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        json: async () => ({
+          error: { code: 'UNAUTHORIZED', message: 'Unauthorized', request_id: 'req-1' },
+        }),
+      });
+
+      await expect(client.getTask('abc')).rejects.toThrow('bgagent login');
+    });
+
+    test('throws ApiError with HTTP status for non-JSON error response', async () => {
+      // A non-JSON body on an HTTP error (WAF HTML page, edge proxy,
+      // 5xx with a plaintext reason) must still carry the status as an
+      // ``ApiError`` so the watch retry loop can classify 4xx vs 5xx.
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 502,
+        statusText: 'Bad Gateway',
+        json: async () => { throw new SyntaxError('Unexpected token'); },
+      });
+
+      await expect(client.getTask('abc')).rejects.toThrow('non-JSON response');
+      // ApiError (not CliError) so isTransientError can see the 502.
+      const err: unknown = await client.getTask('abc').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).statusCode).toBe(502);
+    });
+  });
+
+  describe('authentication mode', () => {
+    const okResponse = { ok: true, json: async () => ({ data: {} }) };
+
+    afterEach(() => {
+      delete process.env.BGAGENT_API_KEY;
+    });
+
+    test('default mode sends the Cognito Authorization header, no X-API-Key', async () => {
+      mockFetch.mockResolvedValue(okResponse);
+      await new ApiClient().listWebhooks();
+      const headers = mockFetch.mock.calls[0][1].headers;
+      expect(headers.Authorization).toBe('mock-token');
+      expect(headers['X-API-Key']).toBeUndefined();
+    });
+
+    test('constructor apiKey sends X-API-Key and skips Cognito', async () => {
+      mockFetch.mockResolvedValue(okResponse);
+      mockGetAuthToken.mockClear();
+      await new ApiClient({ apiKey: 'bgak_k_s' }).listWebhooks();
+      const headers = mockFetch.mock.calls[0][1].headers;
+      expect(headers['X-API-Key']).toBe('bgak_k_s');
+      expect(headers.Authorization).toBeUndefined();
+      expect(mockGetAuthToken).not.toHaveBeenCalled();
+    });
+
+    test('BGAGENT_API_KEY env is used when no explicit key is passed', async () => {
+      process.env.BGAGENT_API_KEY = 'bgak_env_key';
+      mockFetch.mockResolvedValue(okResponse);
+      await new ApiClient().listWebhooks();
+      expect(mockFetch.mock.calls[0][1].headers['X-API-Key']).toBe('bgak_env_key');
+    });
+
+    test('explicit apiKey overrides the environment variable', async () => {
+      process.env.BGAGENT_API_KEY = 'bgak_env_key';
+      mockFetch.mockResolvedValue(okResponse);
+      await new ApiClient({ apiKey: 'bgak_explicit' }).listWebhooks();
+      expect(mockFetch.mock.calls[0][1].headers['X-API-Key']).toBe('bgak_explicit');
+    });
+  });
+});

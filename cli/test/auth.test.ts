@@ -1,0 +1,407 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
+import { changePassword, getAuthToken, login } from '../src/auth';
+import { saveConfig, saveCredentials } from '../src/config';
+
+// Mock the Cognito SDK. Each command constructor tags its params with a
+// ``__command`` discriminator so tests can drive ``mockSend`` per command type
+// (InitiateAuth vs RespondToAuthChallenge vs ChangePassword) instead of relying
+// on brittle call-order alone.
+const mockSend = jest.fn();
+jest.mock('@aws-sdk/client-cognito-identity-provider', () => ({
+  CognitoIdentityProviderClient: jest.fn().mockImplementation(() => ({ send: mockSend })),
+  InitiateAuthCommand: jest.fn().mockImplementation((params) => ({ __command: 'InitiateAuth', ...params })),
+  RespondToAuthChallengeCommand: jest.fn().mockImplementation((params) => ({ __command: 'RespondToAuthChallenge', ...params })),
+  ChangePasswordCommand: jest.fn().mockImplementation((params) => ({ __command: 'ChangePassword', ...params })),
+  AuthFlowType: { USER_PASSWORD_AUTH: 'USER_PASSWORD_AUTH', REFRESH_TOKEN_AUTH: 'REFRESH_TOKEN_AUTH' },
+  ChallengeNameType: { NEW_PASSWORD_REQUIRED: 'NEW_PASSWORD_REQUIRED' },
+}));
+
+/** Build a base64url-encoded ID token carrying the given claims (no signature). */
+function fakeIdToken(claims: Record<string, unknown>): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  return `${header}.${payload}.sig`;
+}
+
+describe('auth', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bgagent-test-'));
+    process.env.BGAGENT_CONFIG_DIR = tmpDir;
+    saveConfig({
+      api_url: 'https://api.example.com',
+      region: 'us-east-1',
+      user_pool_id: 'us-east-1_abc',
+      client_id: 'client123',
+    });
+    mockSend.mockReset();
+  });
+
+  afterEach(() => {
+    delete process.env.BGAGENT_CONFIG_DIR;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  describe('login', () => {
+    test('saves credentials on successful login', async () => {
+      mockSend.mockResolvedValue({
+        AuthenticationResult: {
+          IdToken: 'id-token-123',
+          AccessToken: 'access-token-123',
+          RefreshToken: 'refresh-token-123',
+          ExpiresIn: 3600,
+        },
+      });
+
+      await login('user@example.com', 'password123');
+
+      const creds = JSON.parse(
+        fs.readFileSync(path.join(tmpDir, 'credentials.json'), 'utf-8'),
+      );
+      expect(creds.id_token).toBe('id-token-123');
+      expect(creds.refresh_token).toBe('refresh-token-123');
+      expect(creds.token_expiry).toBeDefined();
+    });
+
+    test('constructs the Cognito client with the ABCA solution User-Agent (#319)', async () => {
+      mockSend.mockResolvedValue({
+        AuthenticationResult: {
+          IdToken: 'id-token-123',
+          RefreshToken: 'refresh-token-123',
+          ExpiresIn: 3600,
+        },
+      });
+
+      await login('user@example.com', 'password123');
+
+      const calls = (CognitoIdentityProviderClient as unknown as jest.Mock).mock.calls;
+      const ctorArg = calls[calls.length - 1][0];
+      expect(ctorArg.customUserAgent).toEqual([['md/uksb-wt64nei4u6', 'cli']]);
+    });
+
+    test('throws on missing auth result', async () => {
+      mockSend.mockResolvedValue({ AuthenticationResult: null });
+      await expect(login('user@example.com', 'pass')).rejects.toThrow('Unexpected authentication response');
+    });
+
+    test('maps NotAuthorizedException to an expired-temp-password hint (no secret leaked)', async () => {
+      // Invited users lapse into a dead temp password after Cognito's default
+      // 7-day window; Cognito answers with a bare NotAuthorizedException. The
+      // CLI should point at a remedy that WORKS for an existing account, not
+      // let the user retype a doomed password — and must not echo the attempted
+      // password. `reset-password`, not `invite-user`: the latter calls
+      // AdminCreateUser, which rejects an existing account, so naming it sends
+      // the admin to a command that refuses (#238 review N7).
+      mockSend.mockRejectedValue(
+        Object.assign(new Error('Incorrect username or password.'), { name: 'NotAuthorizedException' }),
+      );
+      const err = (await login('user@example.com', 'ExpiredTemp1!').catch((e: Error) => e)) as Error;
+      expect(err.message).toMatch(/temporary password expired/);
+      expect(err.message).toContain('bgagent admin reset-password');
+      expect(err.message).not.toContain('invite-user');
+      expect(err.message).not.toContain('ExpiredTemp1!');
+    });
+
+    test('rethrows non-auth InitiateAuth errors unchanged', async () => {
+      mockSend.mockRejectedValue(
+        Object.assign(new Error('getaddrinfo ENOTFOUND cognito-idp'), { name: 'TypeError' }),
+      );
+      await expect(login('user@example.com', 'pass')).rejects.toThrow('getaddrinfo ENOTFOUND');
+    });
+  });
+
+  describe('login — NEW_PASSWORD_REQUIRED first-login challenge', () => {
+    test('prompts for a new password, responds to the challenge, and persists tokens', async () => {
+      mockSend.mockImplementation((cmd: { __command: string }) => {
+        if (cmd.__command === 'InitiateAuth') {
+          return Promise.resolve({ ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: 'sess-abc' });
+        }
+        if (cmd.__command === 'RespondToAuthChallenge') {
+          return Promise.resolve({
+            AuthenticationResult: { IdToken: 'new-id', RefreshToken: 'new-refresh', ExpiresIn: 3600 },
+          });
+        }
+        throw new Error(`unexpected command ${cmd.__command}`);
+      });
+
+      const prompt = jest.fn().mockResolvedValue('N3w$trongPass!');
+      await login('user@example.com', 'TempPass1!', prompt);
+
+      expect(prompt).toHaveBeenCalledTimes(1);
+      // The challenge response must carry the challenged USERNAME + NEW_PASSWORD
+      // and echo the InitiateAuth Session.
+      const challengeCall = mockSend.mock.calls
+        .map((c) => c[0])
+        .find((c: { __command: string }) => c.__command === 'RespondToAuthChallenge');
+      expect(challengeCall).toMatchObject({
+        ChallengeName: 'NEW_PASSWORD_REQUIRED',
+        Session: 'sess-abc',
+        ChallengeResponses: { USERNAME: 'user@example.com', NEW_PASSWORD: 'N3w$trongPass!' },
+      });
+
+      const creds = JSON.parse(fs.readFileSync(path.join(tmpDir, 'credentials.json'), 'utf-8'));
+      expect(creds.id_token).toBe('new-id');
+      expect(creds.refresh_token).toBe('new-refresh');
+    });
+
+    test('errors clearly when the challenge fires but no prompt is supplied (non-interactive)', async () => {
+      mockSend.mockResolvedValue({ ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: 'sess-abc' });
+      await expect(login('user@example.com', 'TempPass1!')).rejects.toThrow(
+        /requires a new password on first login/,
+      );
+    });
+
+    test('surfaces Cognito password-policy rejection on the new password', async () => {
+      mockSend.mockImplementation((cmd: { __command: string }) => {
+        if (cmd.__command === 'InitiateAuth') {
+          return Promise.resolve({ ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: 'sess-abc' });
+        }
+        return Promise.reject(
+          Object.assign(new Error('Password did not conform with policy: minimum length 12'), {
+            name: 'InvalidPasswordException',
+          }),
+        );
+      });
+
+      const prompt = jest.fn().mockResolvedValue('weak');
+      const err = (await login('user@example.com', 'TempPass1!', prompt).catch((e: Error) => e)) as Error;
+      expect(err.message).toContain('New password rejected');
+      expect(err.message).toContain('minimum length 12');
+    });
+  });
+
+  describe('changePassword', () => {
+    beforeEach(() => {
+      // A valid session is required; username comes from the ID token's email claim.
+      saveCredentials({
+        id_token: fakeIdToken({ email: 'user@example.com', sub: 'uuid-1' }),
+        refresh_token: 'refresh-token',
+        token_expiry: new Date(Date.now() + 3600_000).toISOString(),
+      });
+    });
+
+    test('re-authenticates with the current password, then changes it (no persisted access token)', async () => {
+      mockSend.mockImplementation((cmd: { __command: string }) => {
+        if (cmd.__command === 'InitiateAuth') {
+          return Promise.resolve({ AuthenticationResult: { AccessToken: 'acc-token' } });
+        }
+        if (cmd.__command === 'ChangePassword') {
+          return Promise.resolve({});
+        }
+        throw new Error(`unexpected command ${cmd.__command}`);
+      });
+
+      await changePassword('OldPass1!', 'N3w$trongPass!');
+
+      const changeCall = mockSend.mock.calls
+        .map((c) => c[0])
+        .find((c: { __command: string }) => c.__command === 'ChangePassword');
+      expect(changeCall).toMatchObject({
+        AccessToken: 'acc-token',
+        PreviousPassword: 'OldPass1!',
+        ProposedPassword: 'N3w$trongPass!',
+      });
+
+      // The access token is used in-memory only, never written to disk.
+      const creds = JSON.parse(fs.readFileSync(path.join(tmpDir, 'credentials.json'), 'utf-8'));
+      expect(creds.access_token).toBeUndefined();
+    });
+
+    test('wrong current password surfaces a clear error and never calls ChangePassword', async () => {
+      mockSend.mockImplementation((cmd: { __command: string }) => {
+        if (cmd.__command === 'InitiateAuth') {
+          return Promise.reject(
+            Object.assign(new Error('Incorrect username or password.'), { name: 'NotAuthorizedException' }),
+          );
+        }
+        throw new Error(`unexpected command ${cmd.__command}`);
+      });
+
+      await expect(changePassword('WrongPass1!', 'N3w$trongPass!')).rejects.toThrow(
+        'Current password is incorrect.',
+      );
+      const changeCalled = mockSend.mock.calls
+        .map((c) => c[0])
+        .some((c: { __command: string }) => c.__command === 'ChangePassword');
+      expect(changeCalled).toBe(false);
+    });
+
+    test('weak new password surfaces the Cognito policy error', async () => {
+      mockSend.mockImplementation((cmd: { __command: string }) => {
+        if (cmd.__command === 'InitiateAuth') {
+          return Promise.resolve({ AuthenticationResult: { AccessToken: 'acc-token' } });
+        }
+        return Promise.reject(
+          Object.assign(new Error('Password does not conform to policy: not long enough'), {
+            name: 'InvalidPasswordException',
+          }),
+        );
+      });
+
+      const err = (await changePassword('OldPass1!', 'weak').catch((e: Error) => e)) as Error;
+      expect(err.message).toContain('New password rejected');
+      expect(err.message).toContain('not long enough');
+    });
+
+    test('no active session yields a clear "not authenticated" error', async () => {
+      fs.rmSync(path.join(tmpDir, 'credentials.json'), { force: true });
+      await expect(changePassword('OldPass1!', 'N3w$trongPass!')).rejects.toThrow('Not authenticated');
+      expect(mockSend).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getAuthToken', () => {
+    test('returns cached token when not expired', async () => {
+      const futureExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      saveCredentials({
+        id_token: 'cached-id',
+        refresh_token: 'refresh-token',
+        token_expiry: futureExpiry,
+      });
+
+      // getAuthToken returns the ID token used by the REST API.
+      const token = await getAuthToken();
+      expect(token).toBe('cached-id');
+      expect(mockSend).not.toHaveBeenCalled();
+    });
+
+    test('concurrent getAuthToken calls trigger exactly one refresh', async () => {
+      const pastExpiry = new Date(Date.now() - 1000).toISOString();
+      saveCredentials({
+        id_token: 'old-id',
+        refresh_token: 'refresh-token',
+        token_expiry: pastExpiry,
+      });
+
+      // Make the refresh resolve only after we have fired both callers, so
+      // both observe the expired token and would each fire a refresh absent
+      // the in-flight memoization.
+      let resolveSend: (value: unknown) => void = () => undefined;
+      mockSend.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveSend = resolve;
+          }),
+      );
+
+      const p1 = getAuthToken();
+      const p2 = getAuthToken();
+      // Let both calls reach the (shared) refresh await.
+      await Promise.resolve();
+
+      resolveSend({
+        AuthenticationResult: { IdToken: 'new-id', ExpiresIn: 3600 },
+      });
+
+      const [t1, t2] = await Promise.all([p1, p2]);
+      expect(t1).toBe('new-id');
+      expect(t2).toBe('new-id');
+      // The load-bearing assertion: a single Cognito refresh round-trip.
+      expect(mockSend).toHaveBeenCalledTimes(1);
+    });
+
+    test('refreshes expired token', async () => {
+      const pastExpiry = new Date(Date.now() - 1000).toISOString();
+      saveCredentials({
+        id_token: 'old-id',
+        refresh_token: 'refresh-token',
+        token_expiry: pastExpiry,
+      });
+
+      mockSend.mockResolvedValue({
+        AuthenticationResult: {
+          IdToken: 'new-id',
+          ExpiresIn: 3600,
+        },
+      });
+
+      const token = await getAuthToken();
+      expect(token).toBe('new-id');
+    });
+
+    test('treats an unparseable token_expiry as expired (refreshes, not 401s)', async () => {
+      // A corrupt-but-valid-JSON expiry parses to NaN; every comparison
+      // with NaN is false, which used to classify the token as
+      // never-expiring — surfacing as an opaque 401 instead of a refresh.
+      saveCredentials({
+        id_token: 'old-id',
+        refresh_token: 'refresh-token',
+        token_expiry: 'not-a-date',
+      });
+
+      mockSend.mockResolvedValue({
+        AuthenticationResult: {
+          IdToken: 'new-id',
+          ExpiresIn: 3600,
+        },
+      });
+
+      const token = await getAuthToken();
+      expect(token).toBe('new-id');
+      expect(mockSend).toHaveBeenCalledTimes(1);
+    });
+
+    test('throws when no credentials exist', async () => {
+      await expect(getAuthToken()).rejects.toThrow('Not authenticated');
+    });
+
+    test('throws "Session expired" when Cognito rejects the refresh token', async () => {
+      const pastExpiry = new Date(Date.now() - 1000).toISOString();
+      saveCredentials({
+        id_token: 'old-token',
+        refresh_token: 'bad-refresh',
+        token_expiry: pastExpiry,
+      });
+
+      mockSend.mockRejectedValue(
+        Object.assign(new Error('Refresh Token has expired'), { name: 'NotAuthorizedException' }),
+      );
+
+      await expect(getAuthToken()).rejects.toThrow('Session expired');
+    });
+
+    test('transient refresh failure does NOT claim the session expired', async () => {
+      // A network blip is not an auth rejection — telling the user to
+      // re-login is wrong advice, and with the shared in-flight refresh
+      // that message would reach every concurrent caller.
+      const pastExpiry = new Date(Date.now() - 1000).toISOString();
+      saveCredentials({
+        id_token: 'old-token',
+        refresh_token: 'refresh-token',
+        token_expiry: pastExpiry,
+      });
+
+      mockSend.mockRejectedValue(
+        Object.assign(new Error('getaddrinfo ENOTFOUND cognito-idp'), { name: 'TypeError' }),
+      );
+
+      const err = (await getAuthToken().catch((e: Error) => e)) as Error;
+      expect(err.message).toContain('Token refresh failed');
+      expect(err.message).toContain('Retry');
+      expect(err.message).not.toContain('Session expired');
+    });
+  });
+});

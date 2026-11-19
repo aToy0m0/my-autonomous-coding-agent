@@ -1,0 +1,319 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { QueryCommand } from '@aws-sdk/client-dynamodb';
+import { QueryCommand as DocQueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  findStuckTasks,
+  buildConcurrencyReport,
+  countActiveTasksForUser,
+  DEFAULT_MAX_CONCURRENT_TASKS_PER_USER,
+} from '../../src/ops-queries';
+
+const lowLevelSend = jest.fn();
+const docSend = jest.fn();
+
+jest.mock('@aws-sdk/client-dynamodb', () => {
+  const actual = jest.requireActual('@aws-sdk/client-dynamodb');
+  return {
+    ...actual,
+    DynamoDBClient: jest.fn(() => ({ send: lowLevelSend })),
+  };
+});
+
+jest.mock('@aws-sdk/lib-dynamodb', () => {
+  const actual = jest.requireActual('@aws-sdk/lib-dynamodb');
+  return {
+    ...actual,
+    DynamoDBDocumentClient: {
+      from: jest.fn(() => ({ send: docSend })),
+    },
+  };
+});
+
+describe('ops-queries', () => {
+  beforeEach(() => {
+    lowLevelSend.mockReset();
+    docSend.mockReset();
+  });
+
+  test('findStuckTasks parses each status query into a distinct, status-tagged row', async () => {
+    // Older than both thresholds, as rows the index query returns always are.
+    const oldCreated = new Date(Date.now() - 3 * 3600_000).toISOString();
+    // One distinct task per status query (Promise.all fires three queries).
+    lowLevelSend
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'task-submitted' },
+          user_id: { S: 'user-1' },
+          created_at: { S: oldCreated },
+          repo: { S: 'acme/a' },
+        }],
+      })
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'task-hydrating' },
+          user_id: { S: 'user-1' },
+          created_at: { S: oldCreated },
+        }],
+      })
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'task-awaiting' },
+          user_id: { S: 'user-1' },
+          created_at: { S: oldCreated },
+        }],
+      });
+
+    const tasks = await findStuckTasks('us-east-1', 'TaskTable');
+    expect(tasks).toHaveLength(3);
+    // Each row carries the status of the query that produced it, not a shared value.
+    const byId = Object.fromEntries(tasks.map((t) => [t.task_id, t.status]));
+    expect(byId['task-submitted']).toBe('SUBMITTED');
+    expect(byId['task-hydrating']).toBe('HYDRATING');
+    expect(byId['task-awaiting']).toBe('AWAITING_APPROVAL');
+    expect(tasks.find((t) => t.task_id === 'task-submitted')?.repo).toBe('acme/a');
+  });
+
+  test('findStuckTasks queries StatusIndex for each stuck status', async () => {
+    lowLevelSend.mockResolvedValue({ Items: [] });
+
+    await findStuckTasks('us-east-1', 'TaskTable', {
+      strandedTimeoutSeconds: 600,
+      approvalTimeoutSeconds: 3600,
+    });
+
+    expect(lowLevelSend).toHaveBeenCalledTimes(3);
+    const statuses = lowLevelSend.mock.calls.map((call) => {
+      const cmd = call[0] as QueryCommand;
+      return cmd.input.ExpressionAttributeValues?.[':status']?.S;
+    });
+    expect(statuses.sort()).toEqual(['AWAITING_APPROVAL', 'HYDRATING', 'SUBMITTED']);
+  });
+
+  test('findStuckTasks skips malformed items', async () => {
+    lowLevelSend.mockResolvedValue({
+      Items: [{ task_id: { S: 'partial' } }],
+    });
+
+    const tasks = await findStuckTasks('us-east-1', 'TaskTable');
+    expect(tasks).toHaveLength(0);
+  });
+
+  test('findStuckTasks omits optional repo field', async () => {
+    const oldCreated = new Date(Date.now() - 3600_000).toISOString();
+    lowLevelSend.mockResolvedValue({
+      Items: [{
+        task_id: { S: 'task-2' },
+        user_id: { S: 'user-2' },
+        created_at: { S: oldCreated },
+      }],
+    });
+
+    const tasks = await findStuckTasks('us-east-1', 'TaskTable');
+    expect(tasks[0]?.repo).toBeUndefined();
+  });
+
+  test('findStuckTasks ages a task by the time it entered its status, not by its creation', async () => {
+    const ago = (seconds: number) => new Date(Date.now() - seconds * 1000).toISOString();
+    lowLevelSend
+      // SUBMITTED: waited in the admission queue for three hours, picked up a minute ago.
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'picked-up-just-now' },
+          user_id: { S: 'user-1' },
+          created_at: { S: ago(3 * 3600) },
+          status_created_at: { S: `SUBMITTED#${ago(60)}` },
+        }],
+      })
+      .mockResolvedValueOnce({ Items: [] })
+      // AWAITING_APPROVAL: all created long ago; two paused ten minutes ago, one three hours ago.
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'paused-just-now' },
+          user_id: { S: 'user-1' },
+          created_at: { S: ago(5 * 3600) },
+          status_created_at: { S: `AWAITING_APPROVAL#${ago(600)}` },
+        }, {
+          // A row that still carries the entry time of an earlier status is aged
+          // from that time all the same, as the reconciler ages it.
+          task_id: { S: 'paused-just-now-earlier-entry' },
+          user_id: { S: 'user-1' },
+          created_at: { S: ago(5 * 3600) },
+          status_created_at: { S: `RUNNING#${ago(600)}` },
+        }, {
+          task_id: { S: 'paused-too-long' },
+          user_id: { S: 'user-1' },
+          created_at: { S: ago(5 * 3600) },
+          status_created_at: { S: `AWAITING_APPROVAL#${ago(3 * 3600)}` },
+        }],
+      });
+
+    const tasks = await findStuckTasks('us-east-1', 'TaskTable');
+
+    expect(tasks.map((t) => t.task_id)).toEqual(['paused-too-long']);
+    expect(tasks[0].age_seconds).toBeGreaterThanOrEqual(3 * 3600);
+    expect(tasks[0].age_seconds).toBeLessThan(3 * 3600 + 60);
+  });
+
+  test('findStuckTasks falls back to created_at when status_created_at is missing or unreadable', async () => {
+    const created = new Date(Date.now() - 3 * 3600_000).toISOString();
+    lowLevelSend
+      .mockResolvedValueOnce({
+        Items: [{ task_id: { S: 'no-status-time' }, user_id: { S: 'user-1' }, created_at: { S: created } }],
+      })
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'bad-status-time' },
+          user_id: { S: 'user-1' },
+          created_at: { S: created },
+          status_created_at: { S: 'HYDRATING#not-a-date' },
+        }],
+      })
+      .mockResolvedValueOnce({ Items: [] });
+
+    const tasks = await findStuckTasks('us-east-1', 'TaskTable');
+
+    expect(tasks.map((t) => t.task_id).sort()).toEqual(['bad-status-time', 'no-status-time']);
+    for (const task of tasks) {
+      expect(task.age_seconds).toBeGreaterThanOrEqual(3 * 3600);
+    }
+  });
+
+  // The stack does not publish its cap, so the CLI carries a copy. Read as text:
+  // the CLI must not import the CDK package (same technique as model-id.test.ts).
+  test('the default per-user limit is the cap the stack deploys', () => {
+    const stack = fs.readFileSync(
+      path.join(__dirname, '..', '..', '..', 'cdk', 'src', 'stacks', 'agent.ts'),
+      'utf-8',
+    );
+    const deployed = /const maxConcurrentTasksPerUser = (\d+);/.exec(stack)?.[1];
+    expect(deployed).toBeDefined();
+    expect(DEFAULT_MAX_CONCURRENT_TASKS_PER_USER).toBe(Number(deployed));
+  });
+
+  test('countActiveTasksForUser paginates UserStatusIndex', async () => {
+    docSend
+      .mockResolvedValueOnce({
+        Items: [{ status: 'RUNNING' }],
+        LastEvaluatedKey: { user_id: 'user-1' },
+      })
+      .mockResolvedValueOnce({
+        Items: [{ status: 'HYDRATING' }],
+      });
+
+    const count = await countActiveTasksForUser('us-east-1', 'TaskTable', 'user-1');
+    expect(count).toBe(2);
+  });
+
+  test('findStuckTasks paginates StatusIndex query', async () => {
+    const oldCreated = new Date(Date.now() - 3600_000).toISOString();
+    lowLevelSend
+      .mockResolvedValueOnce({
+        Items: [{
+          task_id: { S: 'task-1' },
+          user_id: { S: 'user-1' },
+          created_at: { S: oldCreated },
+        }],
+        LastEvaluatedKey: { task_id: { S: 'task-1' } },
+      })
+      .mockResolvedValueOnce({ Items: [] })
+      .mockResolvedValue({ Items: [] });
+
+    const tasks = await findStuckTasks('us-east-1', 'TaskTable');
+    expect(tasks.length).toBeGreaterThanOrEqual(1);
+    expect(lowLevelSend.mock.calls.length).toBeGreaterThan(3);
+  });
+
+  test('buildConcurrencyReport skips rows without user_id', async () => {
+    docSend
+      .mockResolvedValueOnce({
+        Items: [{ active_count: 1 }, { user_id: 'user-1', active_count: 1 }],
+      })
+      .mockResolvedValueOnce({ Items: [] });
+
+    const rows = await buildConcurrencyReport('us-east-1', 'TaskTable', 'ConcurrencyTable', 3);
+    expect(rows).toHaveLength(1);
+  });
+
+  test('buildConcurrencyReport paginates scan and query', async () => {
+    docSend
+      .mockResolvedValueOnce({
+        Items: [{ user_id: 'user-1', active_count: 1 }],
+        LastEvaluatedKey: { user_id: 'user-1' },
+      })
+      .mockResolvedValueOnce({ Items: [{ status: 'RUNNING' }] })
+      .mockResolvedValueOnce({
+        Items: [{ user_id: 'user-2', active_count: 0 }],
+      })
+      .mockResolvedValueOnce({ Items: [] });
+
+    const rows = await buildConcurrencyReport('us-east-1', 'TaskTable', 'ConcurrencyTable', 3);
+    expect(rows).toHaveLength(2);
+  });
+
+  test('buildConcurrencyReport compares stored and actual counts', async () => {
+    docSend
+      .mockResolvedValueOnce({
+        Items: [{ user_id: 'user-1', active_count: 1 }],
+      })
+      .mockResolvedValueOnce({
+        Items: [{ status: 'RUNNING' }, { status: 'HYDRATING' }],
+      });
+
+    const rows = await buildConcurrencyReport('us-east-1', 'TaskTable', 'ConcurrencyTable', 3);
+    expect(rows).toEqual([{
+      user_id: 'user-1',
+      stored_count: 1,
+      actual_count: 2,
+      limit: 3,
+      drift: -1,
+    }]);
+
+    const scanCmd = docSend.mock.calls[0][0] as ScanCommand;
+    expect(scanCmd.input.TableName).toBe('ConcurrencyTable');
+    const queryCmd = docSend.mock.calls[1][0] as DocQueryCommand;
+    expect(queryCmd.input.IndexName).toBe('UserStatusIndex');
+  });
+
+  test('buildConcurrencyReport reports a per-user error row instead of aborting', async () => {
+    docSend
+      // Scan returns two users.
+      .mockResolvedValueOnce({
+        Items: [{ user_id: 'user-1', active_count: 1 }, { user_id: 'user-2', active_count: 2 }],
+      })
+      // user-1 live count succeeds.
+      .mockResolvedValueOnce({ Items: [{ status: 'RUNNING' }] })
+      // user-2 live count throttles — must not blank the whole report.
+      .mockRejectedValueOnce(
+        Object.assign(new Error('throughput exceeded'), {
+          name: 'ProvisionedThroughputExceededException',
+        }),
+      );
+
+    const rows = await buildConcurrencyReport('us-east-1', 'TaskTable', 'ConcurrencyTable', 3);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.user_id === 'user-1')).toMatchObject({ actual_count: 1, drift: 0 });
+    const failed = rows.find((r) => r.user_id === 'user-2');
+    expect(failed).toMatchObject({ actual_count: null, drift: null });
+    expect(failed?.error).toMatch(/throughput exceeded/);
+  });
+});

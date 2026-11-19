@@ -1,0 +1,239 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { makeConfigureCommand } from '../../src/commands/configure';
+import * as stackOutputs from '../../src/stack-outputs';
+
+jest.mock('../../src/stack-outputs', () => {
+  const actual = jest.requireActual('../../src/stack-outputs');
+  return {
+    ...actual,
+    fetchConfigureBundleFromStack: jest.fn(),
+  };
+});
+
+const fetchConfigureBundleFromStackMock = stackOutputs.fetchConfigureBundleFromStack as jest.Mock;
+
+describe('configure command', () => {
+  let tmpDir: string;
+  let consoleSpy: jest.SpiedFunction<typeof console.log>;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bgagent-test-'));
+    process.env.BGAGENT_CONFIG_DIR = tmpDir;
+    consoleSpy = jest.spyOn(console, 'log').mockImplementation();
+    fetchConfigureBundleFromStackMock.mockReset();
+  });
+
+  afterEach(() => {
+    delete process.env.BGAGENT_CONFIG_DIR;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    consoleSpy.mockRestore();
+  });
+
+  test('saves configuration', async () => {
+    const cmd = makeConfigureCommand();
+    await cmd.parseAsync([
+      'node', 'test',
+      '--api-url', 'https://api.example.com',
+      '--region', 'us-west-2',
+      '--user-pool-id', 'us-west-2_abc',
+      '--client-id', 'client-xyz',
+    ]);
+
+    const config = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, 'config.json'), 'utf-8'),
+    );
+    expect(config.api_url).toBe('https://api.example.com');
+    expect(config.region).toBe('us-west-2');
+    expect(config.user_pool_id).toBe('us-west-2_abc');
+    expect(config.client_id).toBe('client-xyz');
+    expect(consoleSpy).toHaveBeenCalledWith('Configuration saved.');
+  });
+
+  test('partial update: new field value merges onto existing config', async () => {
+    const cmd1 = makeConfigureCommand();
+    await cmd1.parseAsync([
+      'node', 'test',
+      '--api-url', 'https://api.example.com',
+      '--region', 'us-east-1',
+      '--user-pool-id', 'us-east-1_xyz',
+      '--client-id', 'client-123',
+    ]);
+
+    // Update only --region; other fields should persist.
+    const cmd2 = makeConfigureCommand();
+    await cmd2.parseAsync(['node', 'test', '--region', 'us-west-1']);
+
+    const config = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, 'config.json'), 'utf-8'),
+    );
+    expect(config.api_url).toBe('https://api.example.com');
+    expect(config.region).toBe('us-west-1');
+    expect(config.user_pool_id).toBe('us-east-1_xyz');
+    expect(config.client_id).toBe('client-123');
+  });
+
+  test('first-time configure without all required fields → CliError', async () => {
+    const cmd = makeConfigureCommand();
+    await expect(
+      cmd.parseAsync([
+        'node', 'test',
+        '--api-url', 'https://api.example.com',
+        // missing --region, --user-pool-id, --client-id
+      ]),
+    ).rejects.toThrow(/Missing required configuration/);
+  });
+
+  test('--from-bundle decodes a base64 bundle and writes config in one shot', async () => {
+    // Mirrors what `bgagent admin invite-user` would print: the four config
+    // fields encoded as base64 JSON.
+    const payload = {
+      api_url: 'https://api.example.com',
+      region: 'us-east-1',
+      user_pool_id: 'us-east-1_abc',
+      client_id: 'client-123',
+    };
+    const bundle = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64');
+
+    const cmd = makeConfigureCommand();
+    await cmd.parseAsync(['node', 'test', '--from-bundle', bundle]);
+
+    const config = JSON.parse(fs.readFileSync(path.join(tmpDir, 'config.json'), 'utf-8'));
+    expect(config).toEqual(payload);
+    expect(consoleSpy).toHaveBeenCalledWith('Configuration saved.');
+  });
+
+  test('--from-bundle is mutually exclusive with individual flags', async () => {
+    const bundle = Buffer.from(JSON.stringify({
+      api_url: 'https://x', region: 'us-east-1', user_pool_id: 'p', client_id: 'c',
+    }), 'utf-8').toString('base64');
+
+    const cmd = makeConfigureCommand();
+    await expect(cmd.parseAsync([
+      'node', 'test',
+      '--from-bundle', bundle,
+      '--region', 'us-west-2',
+    ])).rejects.toThrow(/mutually exclusive/);
+  });
+
+  test('--stack-name reads configure fields from CloudFormation outputs', async () => {
+    fetchConfigureBundleFromStackMock.mockResolvedValue({
+      api_url: 'https://api.example.com/v1/',
+      region: 'us-east-1',
+      user_pool_id: 'us-east-1_pool',
+      client_id: 'client-from-stack',
+    });
+
+    const cmd = makeConfigureCommand();
+    await cmd.parseAsync([
+      'node', 'test',
+      '--stack-name', 'backgroundagent-dev',
+      '--region', 'us-east-1',
+    ]);
+
+    expect(fetchConfigureBundleFromStackMock).toHaveBeenCalledWith(
+      'us-east-1',
+      'backgroundagent-dev',
+    );
+    const config = JSON.parse(fs.readFileSync(path.join(tmpDir, 'config.json'), 'utf-8'));
+    expect(config.client_id).toBe('client-from-stack');
+    // Feature guards fall back to this for subcommands without --stack-name.
+    expect(config.stack_name).toBe('backgroundagent-dev');
+    expect(consoleSpy).toHaveBeenCalledWith('Configuration saved.');
+  });
+
+  test('forgets the stack name when a hand-entered API URL replaces the one read from it', async () => {
+    const configFile = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(configFile, JSON.stringify({
+      api_url: 'https://a.example.com/v1/', region: 'us-east-1', user_pool_id: 'p', client_id: 'c', stack_name: 'backgroundagent-dev',
+    }));
+    await makeConfigureCommand().parseAsync(['node', 'test', '--client-id', 'c2']);
+    expect(JSON.parse(fs.readFileSync(configFile, 'utf-8')).stack_name).toBe('backgroundagent-dev');
+    await makeConfigureCommand().parseAsync(['node', 'test', '--api-url', 'https://b.example.com/v1/']);
+    expect(JSON.parse(fs.readFileSync(configFile, 'utf-8')).stack_name).toBeUndefined();
+  });
+
+  test('--stack-name allows explicit overrides for individual fields', async () => {
+    fetchConfigureBundleFromStackMock.mockResolvedValue({
+      api_url: 'https://api.example.com/v1/',
+      region: 'us-east-1',
+      user_pool_id: 'us-east-1_pool',
+      client_id: 'client-from-stack',
+    });
+
+    const cmd = makeConfigureCommand();
+    await cmd.parseAsync([
+      'node', 'test',
+      '--stack-name', 'backgroundagent-dev',
+      '--region', 'us-east-1',
+      '--api-url', 'https://override.example.com/v1/',
+    ]);
+
+    const config = JSON.parse(fs.readFileSync(path.join(tmpDir, 'config.json'), 'utf-8'));
+    expect(config.api_url).toBe('https://override.example.com/v1/');
+    expect(config.client_id).toBe('client-from-stack');
+  });
+
+  test('--from-bundle is mutually exclusive with --stack-name', async () => {
+    const bundle = Buffer.from(JSON.stringify({
+      api_url: 'https://x', region: 'us-east-1', user_pool_id: 'p', client_id: 'c',
+    }), 'utf-8').toString('base64');
+
+    const cmd = makeConfigureCommand();
+    await expect(cmd.parseAsync([
+      'node', 'test',
+      '--from-bundle', bundle,
+      '--stack-name', 'backgroundagent-dev',
+    ])).rejects.toThrow(/mutually exclusive/);
+  });
+
+  test('--from-bundle rejects malformed input', async () => {
+    const cmd = makeConfigureCommand();
+    await expect(
+      cmd.parseAsync(['node', 'test', '--from-bundle', 'totally not base64']),
+    ).rejects.toThrow();
+  });
+
+  test('no flags with complete existing config → reports "No configuration changes" without re-saving', async () => {
+    // Seed a complete config.
+    const cmd1 = makeConfigureCommand();
+    await cmd1.parseAsync([
+      'node', 'test',
+      '--api-url', 'https://api.example.com',
+      '--region', 'us-east-1',
+      '--user-pool-id', 'us-east-1_abc',
+      '--client-id', 'client-123',
+    ]);
+    const initialMtime = fs.statSync(path.join(tmpDir, 'config.json')).mtimeMs;
+
+    // Run configure again with no flags.
+    const cmd2 = makeConfigureCommand();
+    await cmd2.parseAsync(['node', 'test']);
+
+    // File was not rewritten.
+    expect(fs.statSync(path.join(tmpDir, 'config.json')).mtimeMs).toBe(initialMtime);
+    // User-facing message is honest about the no-op.
+    expect(consoleSpy).toHaveBeenCalledWith('No configuration changes — all flags were omitted.');
+    expect(consoleSpy).not.toHaveBeenLastCalledWith('Configuration saved.');
+  });
+});

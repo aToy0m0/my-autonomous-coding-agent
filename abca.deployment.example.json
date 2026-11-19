@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "compute": [
+    "agentcore"
+  ],
+  "features": {
+    "slack": false,
+    "linear": false,
+    "jira": false,
+    "deployPreviewScreenshots": false,
+    "agentRegistry": false,
+    "toolGateway": false
+  }
+}

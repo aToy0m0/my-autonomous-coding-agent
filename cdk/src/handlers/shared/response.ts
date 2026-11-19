@@ -1,0 +1,146 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import type { APIGatewayProxyResult } from 'aws-lambda';
+
+/**
+ * Machine-readable error codes matching the API contract.
+ */
+export const ErrorCode = {
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
+  TASK_NOT_FOUND: 'TASK_NOT_FOUND',
+  TRACE_NOT_AVAILABLE: 'TRACE_NOT_AVAILABLE',
+  DUPLICATE_TASK: 'DUPLICATE_TASK',
+  TASK_ALREADY_TERMINAL: 'TASK_ALREADY_TERMINAL',
+  RATE_LIMIT_EXCEEDED: 'RATE_LIMIT_EXCEEDED',
+  WEBHOOK_NOT_FOUND: 'WEBHOOK_NOT_FOUND',
+  WEBHOOK_ALREADY_REVOKED: 'WEBHOOK_ALREADY_REVOKED',
+  API_KEY_NOT_FOUND: 'API_KEY_NOT_FOUND',
+  API_KEY_ALREADY_REVOKED: 'API_KEY_ALREADY_REVOKED',
+  WORKSPACE_NOT_FOUND: 'WORKSPACE_NOT_FOUND',
+  SECRET_DELETE_FAILED: 'SECRET_DELETE_FAILED',
+  REPO_NOT_ONBOARDED: 'REPO_NOT_ONBOARDED',
+  BUDGET_EXCEEDED: 'BUDGET_EXCEEDED',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+  ATTACHMENT_BLOCKED: 'ATTACHMENT_BLOCKED',
+  ATTACHMENT_TOO_LARGE: 'ATTACHMENT_TOO_LARGE',
+  ATTACHMENT_INLINE_TOO_LARGE: 'ATTACHMENT_INLINE_TOO_LARGE',
+  ATTACHMENTS_TOTAL_TOO_LARGE: 'ATTACHMENTS_TOTAL_TOO_LARGE',
+  ATTACHMENT_INVALID_TYPE: 'ATTACHMENT_INVALID_TYPE',
+  ATTACHMENT_INVALID_CONTENT: 'ATTACHMENT_INVALID_CONTENT',
+  ATTACHMENT_INVALID_FILENAME: 'ATTACHMENT_INVALID_FILENAME',
+  ATTACHMENT_SCREENING_UNAVAILABLE: 'ATTACHMENT_SCREENING_UNAVAILABLE',
+  ATTACHMENT_SIZE_MISMATCH: 'ATTACHMENT_SIZE_MISMATCH',
+  ATTACHMENT_UPLOAD_MISSING: 'ATTACHMENT_UPLOAD_MISSING',
+  UPLOADS_NOT_PENDING: 'UPLOADS_NOT_PENDING',
+  SCREENING_DEADLINE_EXCEEDED: 'SCREENING_DEADLINE_EXCEEDED',
+  // Cedar HITL (§7.1 / §7.2 / §7.3). REQUEST_NOT_FOUND collapses "row
+  // missing" and "wrong caller" into a single 404 response so the API
+  // surface does not function as an existence oracle (§7.1 finding #6).
+  REQUEST_NOT_FOUND: 'REQUEST_NOT_FOUND',
+  REQUEST_ALREADY_DECIDED: 'REQUEST_ALREADY_DECIDED',
+  TASK_NOT_AWAITING_APPROVAL: 'TASK_NOT_AWAITING_APPROVAL',
+  // Agent asset registry (#246).
+  REGISTRY_VERSION_EXISTS: 'REGISTRY_VERSION_EXISTS',
+  REGISTRY_RESOLUTION_FAILED: 'REGISTRY_RESOLUTION_FAILED',
+  REGISTRY_RECORD_NOT_FOUND: 'REGISTRY_RECORD_NOT_FOUND',
+  REGISTRY_PUBLISH_INCOMPLETE: 'REGISTRY_PUBLISH_INCOMPLETE',
+} as const;
+
+const COMMON_HEADERS = {
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*',
+};
+
+/**
+ * Build a success response with `{ data: ... }` envelope.
+ * @param statusCode - HTTP status code.
+ * @param data - the response payload.
+ * @param requestId - unique request ID for the X-Request-Id header.
+ * @param extraHeaders - optional additional response headers. Cannot override Content-Type,
+ *   Access-Control-Allow-Origin, or X-Request-Id (common headers always take precedence).
+ * @returns the API Gateway proxy result.
+ */
+export function successResponse(
+  statusCode: number,
+  data: unknown,
+  requestId: string,
+  extraHeaders?: Record<string, string>,
+): APIGatewayProxyResult {
+  return {
+    statusCode,
+    headers: { ...extraHeaders, ...COMMON_HEADERS, 'X-Request-Id': requestId },
+    body: JSON.stringify({ data }),
+  };
+}
+
+/**
+ * Build a paginated list response with `{ data: [...], pagination: { ... } }` envelope.
+ * @param data - the list of items.
+ * @param nextToken - pagination token for the next page, or null if no more pages.
+ * @param requestId - unique request ID for the X-Request-Id header.
+ * @returns the API Gateway proxy result.
+ */
+export function paginatedResponse(
+  data: unknown[],
+  nextToken: string | null,
+  requestId: string,
+): APIGatewayProxyResult {
+  return {
+    statusCode: 200,
+    headers: { ...COMMON_HEADERS, 'X-Request-Id': requestId },
+    body: JSON.stringify({
+      data,
+      pagination: {
+        next_token: nextToken,
+        has_more: nextToken !== null,
+      },
+    }),
+  };
+}
+
+/**
+ * Build an error response with `{ error: { ... } }` envelope.
+ * @param statusCode - HTTP status code.
+ * @param code - machine-readable error code.
+ * @param message - human-readable error message.
+ * @param requestId - unique request ID for the X-Request-Id header.
+ * @returns the API Gateway proxy result.
+ */
+export function errorResponse(
+  statusCode: number,
+  code: string,
+  message: string,
+  requestId: string,
+): APIGatewayProxyResult {
+  return {
+    statusCode,
+    headers: { ...COMMON_HEADERS, 'X-Request-Id': requestId },
+    body: JSON.stringify({
+      error: {
+        code,
+        message,
+        request_id: requestId,
+      },
+    }),
+  };
+}

@@ -1,0 +1,597 @@
+/**
+ *  MIT No Attribution
+ *
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy of
+ *  the Software without restriction, including without limitation the rights to
+ *  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ *  the Software, and to permit persons to whom the Software is furnished to do so.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ */
+
+import { formatEvents, formatJson, formatTaskDetail, formatTaskList, formatWebhookCreated, formatWebhookDetail, formatWebhookList } from '../src/format';
+import { CreateWebhookResponse, TaskDetail, TaskEvent, TaskSummary, WebhookDetail } from '../src/types';
+
+describe('format', () => {
+  const task: TaskDetail = {
+    task_id: 'abc123',
+    status: 'COMPLETED',
+    repo: 'owner/repo',
+    issue_number: 42,
+    issue_title: null,
+    resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+    resolved_assets: null,
+    pr_number: null,
+    task_description: 'Fix the bug',
+    branch_name: 'bgagent/abc123/fix-the-bug',
+    session_id: 'sess-1',
+    pr_url: 'https://github.com/owner/repo/pull/1',
+    error_message: null,
+    error_classification: null,
+    prompt_version: null,
+    channel_source: 'api',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T01:00:00Z',
+    started_at: '2026-01-01T00:01:00Z',
+    completed_at: '2026-01-01T01:00:00Z',
+    agent_heartbeat_at: '2026-01-01T00:59:48Z',
+    duration_s: 3540,
+    cost_usd: 0.1234,
+    build_passed: true,
+    lint_passed: null,
+    otel_trace_id: null,
+    max_turns: 100,
+    max_budget_usd: null,
+    turns_attempted: null,
+    turns_completed: null,
+    trace: false,
+    trace_s3_uri: null,
+    artifact_uri: null,
+    attachments: null,
+    approval_gate_count: 0,
+    approval_gate_cap: 50,
+    awaiting_approval_request_id: null,
+    queued_at: null,
+    queue_position: null,
+    estimated_wait_s: null,
+  };
+
+  describe('formatTaskDetail', () => {
+    test('includes all populated fields', () => {
+      const output = formatTaskDetail(task);
+      expect(output).toContain('Task:        abc123');
+      expect(output).toContain('Status:      COMPLETED');
+      expect(output).toContain('Repo:        owner/repo');
+      expect(output).toContain('Issue:       #42');
+      expect(output).toContain('Description: Fix the bug');
+      expect(output).toContain('Branch:      bgagent/abc123/fix-the-bug');
+      expect(output).toContain('PR:          https://github.com/owner/repo/pull/1');
+      expect(output).toContain('Duration:    3540s');
+      expect(output).toContain('Cost:        $0.1234');
+      expect(output).toContain('Build:       PASSED');
+      expect(output).toContain('Max Turns:   100');
+    });
+
+    test('renders queue position + ETA for a QUEUED task (#441)', () => {
+      const queued: TaskDetail = {
+        ...task,
+        status: 'QUEUED',
+        queued_at: '2026-01-01T00:00:30Z',
+        queue_position: 3,
+        estimated_wait_s: 600,
+      };
+      const output = formatTaskDetail(queued);
+      expect(output).toContain('Status:      QUEUED');
+      expect(output).toContain('Queue:       position 3 (est. wait ~10m)');
+    });
+
+    test('renders queue position without ETA when estimated_wait_s is null', () => {
+      const queued: TaskDetail = {
+        ...task,
+        status: 'QUEUED',
+        queue_position: 1,
+        estimated_wait_s: null,
+      };
+      const output = formatTaskDetail(queued);
+      expect(output).toContain('Queue:       position 1');
+      expect(output).not.toContain('est. wait');
+    });
+
+    test('omits the queue line when position is null (GSI fail-open) or task not QUEUED', () => {
+      const queuedNoPos: TaskDetail = { ...task, status: 'QUEUED', queue_position: null };
+      expect(formatTaskDetail(queuedNoPos)).not.toContain('Queue:');
+      // RUNNING task with a stale position value should not render it either.
+      const running: TaskDetail = { ...task, status: 'RUNNING', queue_position: 2 };
+      expect(formatTaskDetail(running)).not.toContain('Queue:');
+    });
+
+    test('omits null fields', () => {
+      const minimal: TaskDetail = {
+        ...task,
+        issue_number: null,
+        task_description: null,
+        session_id: null,
+        pr_url: null,
+        started_at: null,
+        completed_at: null,
+        duration_s: null,
+        cost_usd: null,
+        build_passed: null,
+        max_turns: null,
+      };
+      const output = formatTaskDetail(minimal);
+      expect(output).not.toContain('Issue:');
+      expect(output).not.toContain('Description:');
+      expect(output).not.toContain('PR:');
+      expect(output).not.toContain('Duration:');
+      expect(output).not.toContain('Cost:');
+      expect(output).not.toContain('Build:');
+      expect(output).not.toContain('Max Turns:');
+    });
+
+    describe('agent_heartbeat_at (ADR-021 P2r2-F11)', () => {
+      // The field exists in DynamoDB and drives the orchestrator's hang detector,
+      // but was never projected into the API response — so `bgagent status`
+      // printed nothing while a 6-second-old beat sat in the table, and a live
+      // verification run concluded "heartbeats not observed". The CLI is the
+      // consumer that makes the signal actionable, so it renders the AGE (the beat
+      // is written every 45 s; the age is what tells you something is wrong).
+
+      test('shows the heartbeat and its age while the task is still running', () => {
+        const running: TaskDetail = {
+          ...task,
+          status: 'RUNNING',
+          completed_at: null,
+          agent_heartbeat_at: new Date(Date.now() - 12_000).toISOString(),
+        };
+        const output = formatTaskDetail(running);
+        expect(output).toContain('Heartbeat:   ');
+        expect(output).toMatch(/Heartbeat:.*\(1[0-9]s\)/);
+      });
+
+      test('hides it on a terminal task, where the last beat is noise', () => {
+        // The fixture is COMPLETED and DOES carry a heartbeat, so this asserts the
+        // suppression rather than an absent value.
+        expect(task.agent_heartbeat_at).not.toBeNull();
+        expect(formatTaskDetail(task)).not.toContain('Heartbeat:');
+      });
+
+      test('hides it when the agent has not beaten yet', () => {
+        const running: TaskDetail = {
+          ...task,
+          status: 'RUNNING',
+          completed_at: null,
+          agent_heartbeat_at: null,
+        };
+        expect(formatTaskDetail(running)).not.toContain('Heartbeat:');
+      });
+
+      test('degrades to a placeholder rather than throwing on a malformed value', () => {
+        // A bad timestamp must not take out `bgagent status` — the command a user
+        // reaches for when something is already wrong.
+        const running: TaskDetail = {
+          ...task,
+          status: 'RUNNING',
+          completed_at: null,
+          agent_heartbeat_at: 'not-a-timestamp',
+        };
+        expect(() => formatTaskDetail(running)).not.toThrow();
+        expect(formatTaskDetail(running)).toContain('Heartbeat:   not-a-timestamp (—)');
+      });
+
+      test('renders the age against an INJECTED now, deterministically', () => {
+        // Review nit: this function read `Date.now()` internally, unlike its
+        // `formatStatusSnapshot` sibling, so the only interesting case — a beat old
+        // enough to be the signal — could not be asserted without wall-clock games.
+        const beat = '2026-08-07T00:00:00.000Z';
+        const running: TaskDetail = {
+          ...task,
+          status: 'RUNNING',
+          completed_at: null,
+          agent_heartbeat_at: beat,
+        };
+
+        const now = Date.parse('2026-08-07T00:05:30.000Z');
+
+        expect(formatTaskDetail(running, now)).toContain(`Heartbeat:   ${beat} (5m 30s)`);
+      });
+
+      test('the same input and now always render the same output', () => {
+        const running: TaskDetail = {
+          ...task,
+          status: 'RUNNING',
+          completed_at: null,
+          agent_heartbeat_at: '2026-08-07T00:00:00.000Z',
+        };
+        const now = Date.parse('2026-08-07T01:00:00.000Z');
+
+        expect(formatTaskDetail(running, now)).toBe(formatTaskDetail(running, now));
+      });
+    });
+
+    test('renders a repo-less placeholder when repo is null (#248 Phase 3)', () => {
+      const repoless: TaskDetail = {
+        ...task,
+        repo: null,
+        resolved_workflow: { id: 'default/agent-v1', version: '1.0.0' },
+      };
+      const output = formatTaskDetail(repoless);
+      expect(output).toContain('Repo:        — (repo-less)');
+      expect(output).not.toContain('Repo:        null');
+    });
+
+    test('shows workflow and pr_number for pr_iteration', () => {
+      const prTask: TaskDetail = {
+        ...task,
+        resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' },
+        pr_number: 42,
+        issue_number: null,
+      };
+      const output = formatTaskDetail(prTask);
+      expect(output).toContain('Workflow:    coding/pr-iteration-v1');
+      expect(output).toContain('PR #:        42');
+    });
+
+    test('omits workflow line for the default coding/new-task-v1', () => {
+      const output = formatTaskDetail(task);
+      expect(output).not.toContain('Workflow:');
+      expect(output).not.toContain('PR #:');
+    });
+
+    test('renders Trace S3 line when trace_s3_uri is non-null', () => {
+      const traced: TaskDetail = {
+        ...task,
+        trace: true,
+        trace_s3_uri: 's3://trace-bucket/tenants/u1/tasks/abc123/trace.jsonl.gz',
+      };
+      const output = formatTaskDetail(traced);
+      expect(output).toContain(
+        'Trace S3:    s3://trace-bucket/tenants/u1/tasks/abc123/trace.jsonl.gz',
+      );
+    });
+
+    test('omits Trace S3 line when trace_s3_uri is null', () => {
+      const output = formatTaskDetail(task);
+      expect(output).not.toContain('Trace S3:');
+    });
+
+    test('renders Artifact line when artifact_uri is non-null (#248 Phase 3)', () => {
+      const withArtifact: TaskDetail = {
+        ...task,
+        artifact_uri: 's3://artifacts-bkt/artifacts/abc123/result.md',
+      };
+      const output = formatTaskDetail(withArtifact);
+      expect(output).toContain('Artifact:    s3://artifacts-bkt/artifacts/abc123/result.md');
+    });
+
+    test('omits Artifact line when artifact_uri is null', () => {
+      const output = formatTaskDetail(task);
+      expect(output).not.toContain('Artifact:');
+    });
+
+    test('shows classified error with raw detail when error_classification is present', () => {
+      const failedTask: TaskDetail = {
+        ...task,
+        status: 'FAILED',
+        error_message: 'User concurrency limit reached',
+        error_classification: {
+          category: 'concurrency',
+          title: 'Concurrency limit reached',
+          description: 'The maximum number of concurrent tasks for this user has been reached.',
+          remedy: 'Wait for an active task to complete, cancel a running task, or ask an admin to increase the limit.',
+          retryable: true,
+        },
+      };
+      const output = formatTaskDetail(failedTask);
+      expect(output).toContain('[CONCURRENCY] Concurrency limit reached');
+      expect(output).toContain('The maximum number of concurrent tasks');
+      expect(output).toContain('Remedy:');
+      expect(output).toContain('Retryable: yes');
+      expect(output).toContain('Detail:    User concurrency limit reached');
+    });
+
+    test('shows retryable: no for non-retryable errors', () => {
+      const failedTask: TaskDetail = {
+        ...task,
+        status: 'FAILED',
+        error_message: 'Guardrail blocked: prompt injection',
+        error_classification: {
+          category: 'guardrail',
+          title: 'Content blocked by guardrail',
+          description: 'Bedrock Guardrails blocked the task content.',
+          remedy: 'Review the task description for policy violations.',
+          retryable: false,
+        },
+      };
+      const output = formatTaskDetail(failedTask);
+      expect(output).toContain('[GUARDRAIL] Content blocked by guardrail');
+      expect(output).toContain('Retryable: no');
+      expect(output).toContain('Detail:    Guardrail blocked: prompt injection');
+    });
+
+    test('falls back to raw error_message when classification is absent', () => {
+      const failedTask: TaskDetail = {
+        ...task,
+        status: 'FAILED',
+        error_message: 'Something unexpected',
+        error_classification: null,
+      };
+      const output = formatTaskDetail(failedTask);
+      expect(output).toContain('Error:       Something unexpected');
+    });
+  });
+
+  describe('formatTaskList', () => {
+    test('shows table with headers', () => {
+      const tasks: TaskSummary[] = [{
+        task_id: 'abc',
+        status: 'RUNNING',
+        repo: 'owner/repo',
+        issue_number: 1,
+        issue_title: null,
+        resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+        resolved_assets: null,
+        pr_number: null,
+        task_description: null,
+        branch_name: 'bgagent/abc/fix',
+        pr_url: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        agent_heartbeat_at: null,
+        cost_usd: null,
+        completed_at: null,
+        channel_source: 'api',
+      }];
+      const output = formatTaskList(tasks);
+      expect(output).toContain('TASK ID');
+      expect(output).toContain('STATUS');
+      expect(output).toContain('abc');
+      expect(output).toContain('RUNNING');
+    });
+
+    describe('HEARTBEAT column (in-guest liveness at list level)', () => {
+      // "Is anything still alive?" is a LIST question. While the field was only on
+      // the detail view, answering it meant one `bgagent status` per task — which is
+      // how a hung task goes unnoticed. Same suppression rules as the detail view so
+      // the two never disagree.
+      const base: TaskSummary = {
+        task_id: 'abc',
+        status: 'RUNNING',
+        repo: 'owner/repo',
+        issue_number: null,
+        issue_title: null,
+        resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+        resolved_assets: null,
+        pr_number: null,
+        task_description: 'work',
+        branch_name: 'bgagent/abc/fix',
+        pr_url: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        agent_heartbeat_at: null,
+        cost_usd: null,
+        completed_at: null,
+        channel_source: 'api',
+      };
+      const now = Date.parse('2026-08-07T00:05:30.000Z');
+
+      test('renders the header', () => {
+        expect(formatTaskList([base], now)).toContain('HEARTBEAT');
+      });
+
+      test('renders the age for a live task, against an injected now', () => {
+        const live = { ...base, agent_heartbeat_at: '2026-08-07T00:05:18.000Z' };
+        expect(formatTaskList([live], now)).toContain('12s ago');
+      });
+
+      test('shows a placeholder when the agent has not beaten yet', () => {
+        expect(formatTaskList([base], now)).toContain('—');
+      });
+
+      test('suppresses it on a terminal task, where the last beat is noise', () => {
+        const done = {
+          ...base,
+          status: 'COMPLETED' as const,
+          agent_heartbeat_at: '2026-08-07T00:05:18.000Z',
+        };
+        expect(formatTaskList([done], now)).not.toContain('12s ago');
+      });
+
+      test('a stale beat renders as an obviously large age, not as healthy', () => {
+        // The actionable case: the beat cadence is 45 s, so minutes of age is the
+        // signal. The orchestrator fails the task at grace 120 s + stale 240 s.
+        const stale = { ...base, agent_heartbeat_at: '2026-08-06T23:55:00.000Z' };
+        expect(formatTaskList([stale], now)).toContain('10m 30s ago');
+      });
+
+      test('is deterministic for a fixed now', () => {
+        const live = { ...base, agent_heartbeat_at: '2026-08-07T00:05:18.000Z' };
+        expect(formatTaskList([live], now)).toBe(formatTaskList([live], now));
+      });
+    });
+
+    test('shows task description when present', () => {
+      const tasks: TaskSummary[] = [{
+        task_id: 'abc',
+        status: 'RUNNING',
+        repo: 'owner/repo',
+        issue_number: null,
+        issue_title: null,
+        resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+        resolved_assets: null,
+        pr_number: null,
+        task_description: 'Fix the login bug',
+        branch_name: 'bgagent/abc/fix',
+        pr_url: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        agent_heartbeat_at: null,
+        cost_usd: null,
+        completed_at: null,
+        channel_source: 'api',
+      }];
+      const output = formatTaskList(tasks);
+      expect(output).toContain('Fix the login bug');
+      expect(output).not.toContain('#null');
+    });
+
+    test('shows issue number when no description', () => {
+      const tasks: TaskSummary[] = [{
+        task_id: 'abc',
+        status: 'RUNNING',
+        repo: 'owner/repo',
+        issue_number: 42,
+        issue_title: null,
+        resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+        resolved_assets: null,
+        pr_number: null,
+        task_description: null,
+        branch_name: 'bgagent/abc/fix',
+        pr_url: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        agent_heartbeat_at: null,
+        cost_usd: null,
+        completed_at: null,
+        channel_source: 'api',
+      }];
+      const output = formatTaskList(tasks);
+      expect(output).toContain('#42');
+    });
+
+    test('shows a dash for a repo-less task (#248 Phase 3)', () => {
+      const tasks: TaskSummary[] = [{
+        task_id: 'abc',
+        status: 'RUNNING',
+        repo: null,
+        issue_number: null,
+        issue_title: null,
+        resolved_workflow: { id: 'default/agent-v1', version: '1.0.0' },
+        resolved_assets: null,
+        pr_number: null,
+        task_description: 'Summarise these papers',
+        branch_name: 'bgagent/abc/task',
+        pr_url: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        agent_heartbeat_at: null,
+        cost_usd: null,
+        completed_at: null,
+        channel_source: 'api',
+      }];
+      const output = formatTaskList(tasks);
+      expect(output).toContain('—');
+      expect(output).not.toContain('null');
+    });
+
+    test('returns message for empty list', () => {
+      expect(formatTaskList([])).toBe('No tasks found.');
+    });
+  });
+
+  describe('formatEvents', () => {
+    test('shows event timeline', () => {
+      const events: TaskEvent[] = [{
+        event_id: 'evt-1',
+        event_type: 'TASK_SUBMITTED',
+        timestamp: '2026-01-01T00:00:00Z',
+        metadata: { source: 'cli' },
+      }];
+      const output = formatEvents(events);
+      expect(output).toContain('TIMESTAMP');
+      expect(output).toContain('EVENT TYPE');
+      expect(output).toContain('TASK_SUBMITTED');
+    });
+
+    test('returns message for empty events', () => {
+      expect(formatEvents([])).toBe('No events found.');
+    });
+  });
+
+  describe('formatWebhookCreated', () => {
+    test('includes webhook fields and secret warning', () => {
+      const res: CreateWebhookResponse = {
+        webhook_id: 'wh-abc',
+        name: 'My CI Pipeline',
+        secret: 'whsec_supersecret123',
+        created_at: '2026-01-01T00:00:00Z',
+      };
+      const output = formatWebhookCreated(res);
+      expect(output).toContain('Webhook:     wh-abc');
+      expect(output).toContain('Name:        My CI Pipeline');
+      expect(output).toContain('Created:     2026-01-01T00:00:00Z');
+      expect(output).toContain('Secret (store securely — shown only once):');
+      expect(output).toContain('whsec_supersecret123');
+    });
+  });
+
+  describe('formatWebhookList', () => {
+    test('shows table with headers', () => {
+      const webhooks: WebhookDetail[] = [{
+        webhook_id: 'wh-1',
+        name: 'CI Pipeline',
+        status: 'active',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        revoked_at: null,
+      }];
+      const output = formatWebhookList(webhooks);
+      expect(output).toContain('WEBHOOK ID');
+      expect(output).toContain('NAME');
+      expect(output).toContain('STATUS');
+      expect(output).toContain('CREATED');
+      expect(output).toContain('wh-1');
+      expect(output).toContain('active');
+    });
+
+    test('returns message for empty list', () => {
+      expect(formatWebhookList([])).toBe('No webhooks found.');
+    });
+  });
+
+  describe('formatWebhookDetail', () => {
+    test('includes all fields', () => {
+      const webhook: WebhookDetail = {
+        webhook_id: 'wh-1',
+        name: 'CI Pipeline',
+        status: 'revoked',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T01:00:00Z',
+        revoked_at: '2026-01-01T01:00:00Z',
+      };
+      const output = formatWebhookDetail(webhook);
+      expect(output).toContain('Webhook:     wh-1');
+      expect(output).toContain('Name:        CI Pipeline');
+      expect(output).toContain('Status:      revoked');
+      expect(output).toContain('Revoked:     2026-01-01T01:00:00Z');
+    });
+
+    test('omits revoked_at when null', () => {
+      const webhook: WebhookDetail = {
+        webhook_id: 'wh-1',
+        name: 'CI Pipeline',
+        status: 'active',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        revoked_at: null,
+      };
+      const output = formatWebhookDetail(webhook);
+      expect(output).not.toContain('Revoked:');
+    });
+  });
+
+  describe('formatJson', () => {
+    test('returns pretty-printed JSON', () => {
+      const data = { task_id: 'abc' };
+      expect(formatJson(data)).toBe(JSON.stringify(data, null, 2));
+    });
+  });
+});
